@@ -367,7 +367,7 @@ async fn refresh_devices(
                     connection,
                     &format!("{model} conectado"),
                     "Aceptá la depuración USB en la pantalla del teléfono para poder usar sus aplicaciones.",
-                    "phonelink",
+                    notify::PHONE_ICON,
                 )
                 .await;
             }
@@ -376,7 +376,7 @@ async fn refresh_devices(
                     connection,
                     &format!("{model} conectado"),
                     "Sus aplicaciones ya están disponibles en el menú.",
-                    "phonelink",
+                    notify::PHONE_ICON,
                 )
                 .await;
             }

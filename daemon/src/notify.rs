@@ -11,6 +11,14 @@ use zbus::Connection;
 const NOTIFICATIONS: &str = "org.freedesktop.Notifications";
 const NOTIFICATIONS_PATH: &str = "/org/freedesktop/Notifications";
 
+/// The icon shown on every notification from this service.
+///
+/// A freedesktop icon name, not a path: the notification daemon resolves it
+/// against the theme in use, so it follows light and dark like every other
+/// icon in the session. `smartphone` ships in vasakos-icon-theme under
+/// `devices/`, at every size from 16 to 512.
+pub const PHONE_ICON: &str = "smartphone";
+
 /// Sends a notification, and says nothing if it cannot.
 ///
 /// A missing notification daemon is not a reason to fail a connection: the
