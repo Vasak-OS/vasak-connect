@@ -1,0 +1,11 @@
+[package]
+name = "vasak-connect-protocol"
+description = "Shared D-Bus contract for the VasakOS Android device service"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+zbus.workspace = true

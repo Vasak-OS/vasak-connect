@@ -1,0 +1,21 @@
+# The daemon and the protocol are split so the panel and the settings screen —
+# which live in other repositories — can depend on the contract without pulling
+# in udev, adb or anything else the service needs to do its job.
+[workspace]
+resolver = "2"
+members = ["protocol", "daemon"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Vasak Group", "Joaquin (Pato) Decima"]
+license = "GPL-3.0-or-later"
+
+[workspace.dependencies]
+vasak-connect-protocol = { path = "protocol" }
+serde = { version = "1", features = ["derive"] }
+# The `tokio` feature makes zbus run interface methods on the Tokio runtime.
+# Without it they execute on zbus's own executor, where anything from
+# `tokio::time` panics with "there is no reactor running".
+zbus = { version = "5", features = ["tokio"] }
+tokio = { version = "1", features = ["full"] }

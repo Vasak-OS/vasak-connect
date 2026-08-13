@@ -1,0 +1,6 @@
+[D-BUS Service]
+# Normally already running as a user service; this lets the panel start it if
+# somebody opens the menu before graphical-session.target got that far.
+Name=ar.net.vasak.os.Connect
+Exec=/usr/bin/vasak-connect
+SystemdService=vasak-connect.service

@@ -1,0 +1,12 @@
+# Android devices with USB debugging enabled.
+#
+# The match is on the ADB interface descriptor — vendor-specific class ff,
+# subclass 42, protocol 01 — and not on a list of vendor ids. That triple is
+# part of the ADB protocol, so it is identical on every phone from every
+# manufacturer; the vendor id lists that ship with `android-udev` run to
+# hundreds of entries and still miss devices.
+#
+# uaccess hands the device to whoever is logged in at the seat, and only while
+# they are. Adding the user to a group would grant it to every session on the
+# machine, permanently.
+SUBSYSTEM=="usb", ENV{ID_USB_INTERFACES}=="*:ff4201:*", TAG+="uaccess"

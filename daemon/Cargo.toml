@@ -1,0 +1,22 @@
+[package]
+name = "vasak-connect-daemon"
+description = "VasakOS Android device service: hotplug, app listing and per-app windows"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "vasak-connect"
+path = "src/main.rs"
+
+[dependencies]
+vasak-connect-protocol.workspace = true
+serde.workspace = true
+serde_json = "1"
+zbus.workspace = true
+tokio.workspace = true
+udev = "0.9"
+libc = "0.2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
