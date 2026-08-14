@@ -471,13 +471,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             _ = reaper.tick() => {
-                let finished = {
+                let (finished, settling) = {
                     let mut state = state.lock().await;
-                    state.windows.reap()
+                    let finished = state.windows.reap();
+                    // Tapping "Allow USB debugging" on the phone produces no
+                    // udev event: the USB device does not re-enumerate, only
+                    // adb's answer changes. So a device left in a transient
+                    // state has to be asked about again, or the menu keeps
+                    // showing "not authorised" for a phone that already is —
+                    // and nothing would ever correct it.
+                    let settling = state.devices.values().any(|device| {
+                        matches!(device.state, DeviceState::Unauthorized | DeviceState::Connecting)
+                    });
+                    (finished, settling)
                 };
+
                 for (serial, package) in finished {
                     debug!(%serial, %package, "la ventana se cerró");
                     let _ = ConnectService::app_closed(&emitter, &serial, &package).await;
+                }
+
+                // Only while something is in flight. With every device ready —
+                // or none connected — this costs nothing, which is the whole
+                // point of not polling adb in the first place.
+                if settling {
+                    refresh_devices(&state, &emitter, &connection).await;
                 }
             }
         }
