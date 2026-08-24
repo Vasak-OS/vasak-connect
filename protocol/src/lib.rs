@@ -121,6 +121,95 @@ pub struct RunningApp {
     pub pid: u32,
 }
 
+// ── Cameras ─────────────────────────────────────────────────────────────────
+
+/// The v4l2loopback card label the service looks for.
+///
+/// The daemon finds the loopback device by *name*, not by a fixed
+/// `/dev/videoN`: the number depends on how many real cameras the machine has
+/// and on the order the kernel probed them. This constant is therefore the one
+/// place where the name lives — it has to match `packaging/modprobe.d`
+/// character for character, and a rename that touches only one of the two
+/// produces a service that reports "no loopback" on a system that has one.
+///
+/// **Keep it under 32 bytes.** V4L2 truncates a card label to 31 characters,
+/// and sysfs reports the truncated form: the built-in webcam on the development
+/// machine reads back as `BisonCam,NB Pro: BisonCam,NB Pr`. The lookup compares
+/// for equality, so a longer name here would match nothing at all — and the
+/// symptom would be "no loopback device" on a system where the module is
+/// loaded and working.
+pub const WEBCAM_CARD_LABEL: &str = "VasakOS Phone";
+
+/// Which way a camera points.
+///
+/// This is the only thing that tells a person which camera they are choosing:
+/// an id of `0` or `2` means nothing to anybody.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[zvariant(signature = "s")]
+#[serde(rename_all = "lowercase")]
+pub enum CameraFacing {
+    Back,
+    Front,
+    /// Clipped on, or a word scrcpy reported that this version does not know.
+    External,
+}
+
+impl CameraFacing {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CameraFacing::Back => "back",
+            CameraFacing::Front => "front",
+            CameraFacing::External => "external",
+        }
+    }
+
+    /// Anything unrecognised becomes `External` rather than an error: a phone
+    /// with a camera arrangement this version has not seen should still be
+    /// listed, just without a promise about where it points.
+    pub fn parse(text: &str) -> Self {
+        match text.trim() {
+            "back" => CameraFacing::Back,
+            "front" => CameraFacing::Front,
+            _ => CameraFacing::External,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct Camera {
+    /// scrcpy's camera id. Opaque, and only unique within one device.
+    pub id: String,
+    pub facing: CameraFacing,
+    /// Capture sizes the sensor accepts, largest first, as `1280x720`.
+    ///
+    /// Comes from the phone rather than from a list of common resolutions:
+    /// asking for a size the sensor does not support is how the stream opens
+    /// and dies half a second later.
+    pub sizes: Vec<String>,
+    /// Frame rates the camera reports, ascending.
+    pub fps: Vec<u32>,
+}
+
+/// What the webcam bridge is doing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct WebcamState {
+    /// Whether a phone camera is being written to the loopback device now.
+    pub active: bool,
+    /// The device other applications open, e.g. `/dev/video42`.
+    ///
+    /// Empty when the v4l2loopback module is not loaded. That is reported here,
+    /// outside `active`, because it is the one failure a person can actually
+    /// fix — and they need to see it before pressing anything, not as an error
+    /// after.
+    pub device: String,
+    /// Which phone is feeding it. Empty unless `active`.
+    pub serial: String,
+    /// Empty unless `active`.
+    pub camera_id: String,
+    /// Empty unless `active`.
+    pub size: String,
+}
+
 // ── Errors ──────────────────────────────────────────────────────────────────
 
 /// Reasons a request cannot be honoured, phrased so the caller can decide
@@ -136,4 +225,11 @@ pub mod errors {
     pub const MISSING_TOOL: &str = "ar.net.vasak.os.Connect.MissingTool";
     /// The app refused to start, or scrcpy could not create a virtual display.
     pub const LAUNCH_FAILED: &str = "ar.net.vasak.os.Connect.LaunchFailed";
+    /// The v4l2loopback module is not loaded, so there is nothing to write the
+    /// camera into. Distinct from a generic failure because the fix is a
+    /// `modprobe` — or a reboot after a kernel update — and not a retry.
+    pub const NO_LOOPBACK: &str = "ar.net.vasak.os.Connect.NoLoopback";
+    /// The bridge is already streaming. A v4l2 device takes one producer, so a
+    /// second camera cannot be added; the caller has to stop the first.
+    pub const WEBCAM_BUSY: &str = "ar.net.vasak.os.Connect.WebcamBusy";
 }
