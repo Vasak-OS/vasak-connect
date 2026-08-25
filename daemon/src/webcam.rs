@@ -141,6 +141,7 @@ pub fn parse_cameras(output: &str) -> Vec<Camera> {
 
         if let Some(rest) = trimmed.strip_prefix("--camera-id=") {
             // `0    (back, 4096x3072, fps={10, 15, 20, 30, 60}, ...)`
+            // …or, on scrcpy 3.x, the same line with `fps=[…]`. See `parse_fps`.
             let mut parts = rest.splitn(2, '(');
             let id = parts.next().unwrap_or("").trim().to_string();
             if id.is_empty() {
@@ -154,15 +155,7 @@ pub fn parse_cameras(output: &str) -> Vec<Camera> {
                 .map(CameraFacing::parse)
                 .unwrap_or(CameraFacing::External);
 
-            let fps = detail
-                .split_once("fps={")
-                .and_then(|(_, tail)| tail.split_once('}'))
-                .map(|(list, _)| {
-                    list.split(',')
-                        .filter_map(|n| n.trim().parse::<u32>().ok())
-                        .collect::<Vec<u32>>()
-                })
-                .unwrap_or_default();
+            let fps = parse_fps(detail);
 
             cameras.push(Camera {
                 id,
@@ -174,8 +167,13 @@ pub fn parse_cameras(output: &str) -> Vec<Camera> {
         }
 
         // `- 1280x720`, which belongs to the camera whose header came last.
+        //
+        // A high-speed size carries its own frame rates — `- 1280x720 (fps={240})`
+        // — so only the first token is the resolution. Taking the whole rest of
+        // the line dropped those sizes entirely: they failed the `WxH` check and
+        // were silently skipped, on exactly the phones that offer slow motion.
         if let Some(size) = trimmed.strip_prefix("- ") {
-            let size = size.trim();
+            let size = size.split_whitespace().next().unwrap_or("");
             if is_size(size) {
                 if let Some(camera) = cameras.last_mut() {
                     camera.sizes.push(size.to_string());
@@ -185,6 +183,39 @@ pub fn parse_cameras(output: &str) -> Vec<Camera> {
     }
 
     cameras
+}
+
+/// Reads the frame-rate list out of a camera's detail text.
+///
+/// Two delimiters, because scrcpy changed how it prints the set and the README
+/// declares 3.0 as the minimum:
+///
+/// * **3.x** appends a `SortedSet<Integer>` straight into the message, and
+///   Java's own `toString` renders a collection with square brackets:
+///   `fps=[10, 15, 20, 30, 60]`.
+/// * **4.x** formats it by hand instead: `fps={10, 15, 20, 30, 60}`.
+///
+/// Matching only the 4.x form left every camera with an empty frame-rate list on
+/// scrcpy 3.x — not an error anywhere, just a picker with no rates to offer.
+fn parse_fps(detail: &str) -> Vec<u32> {
+    let Some((_, tail)) = detail.split_once("fps=") else {
+        return Vec::new();
+    };
+    let closing = match tail.chars().next() {
+        Some('{') => '}',
+        Some('[') => ']',
+        // A future release could print a bare number or something else again.
+        // Reporting no rates is the honest answer; the phone picks its own.
+        _ => return Vec::new(),
+    };
+
+    let Some((list, _)) = tail[1..].split_once(closing) else {
+        return Vec::new();
+    };
+
+    list.split(',')
+        .filter_map(|value| value.trim().parse::<u32>().ok())
+        .collect()
 }
 
 /// Whether a token is a `WIDTHxHEIGHT` pair.
@@ -477,6 +508,60 @@ INFO:     -->   (usb)  ZY22HB6KPB                      device  motorola_edge_40
         // "INFO: ADB device found:" and the scrcpy version line are in the
         // sample; if either were parsed we would have more than two cameras.
         assert_eq!(parse_cameras(REAL_OUTPUT).len(), 2);
+    }
+
+    /// The same two cameras as reported by scrcpy 3.x, where the frame-rate set
+    /// is printed by Java's collection `toString` and comes out in brackets.
+    const SCRCPY_3_OUTPUT: &str = "\
+[server] INFO: List of cameras:
+    --camera-id=0    (back, 4096x3072, fps=[10, 15, 20, 30, 60], zoom-range=[1, 8])
+        - 4096x3072
+        - 1280x720
+    --camera-id=1    (front, 3264x2448, fps=[10, 15, 20, 24, 30])
+        - 1280x720
+";
+
+    #[test]
+    fn scrcpy_3_frame_rates_are_read_too() {
+        let cameras = parse_cameras(SCRCPY_3_OUTPUT);
+        assert_eq!(cameras.len(), 2);
+        assert_eq!(cameras[0].fps, [10, 15, 20, 30, 60]);
+        assert_eq!(cameras[1].fps, [10, 15, 20, 24, 30]);
+    }
+
+    #[test]
+    fn the_zoom_range_is_not_mistaken_for_the_frame_rates() {
+        // Both are in brackets on scrcpy 3.x, and `zoom-range` comes second on
+        // the line — reading from the wrong one would report a camera that
+        // captures at 1 and 8 fps.
+        let cameras = parse_cameras(SCRCPY_3_OUTPUT);
+        assert_eq!(cameras[0].fps, [10, 15, 20, 30, 60]);
+    }
+
+    #[test]
+    fn both_scrcpy_generations_agree_on_the_same_camera() {
+        let modern = parse_cameras(REAL_OUTPUT);
+        let legacy = parse_cameras(SCRCPY_3_OUTPUT);
+        assert_eq!(modern[0].fps, legacy[0].fps);
+        assert_eq!(modern[0].facing, legacy[0].facing);
+    }
+
+    #[test]
+    fn a_high_speed_size_keeps_its_resolution() {
+        // scrcpy prints the frame rates next to the size for high-speed modes.
+        // The whole line is not a resolution, so only the first token is taken —
+        // otherwise these sizes failed the `WxH` check and vanished.
+        let cameras = parse_cameras(
+            "    --camera-id=0    (back, 800x600, fps={30})\n        - 1280x720 (fps={120, 240})\n        - 800x600\n",
+        );
+        assert_eq!(cameras[0].sizes, ["1280x720", "800x600"]);
+    }
+
+    #[test]
+    fn an_unknown_delimiter_reports_no_rates_rather_than_nonsense() {
+        let cameras = parse_cameras("    --camera-id=0    (back, 800x600, fps=30)\n");
+        assert_eq!(cameras.len(), 1);
+        assert!(cameras[0].fps.is_empty());
     }
 
     #[test]
