@@ -18,6 +18,7 @@ mod adb;
 mod hotplug;
 mod notify;
 mod registry;
+mod webcam;
 mod windows;
 
 use std::collections::HashMap;
@@ -33,8 +34,9 @@ use zbus::{connection, interface};
 
 use registry::Registry;
 use vasak_connect_protocol::{
-    App, Device, DeviceState, RunningApp, SERVICE_NAME, SERVICE_PATH,
+    App, Camera, Device, DeviceState, RunningApp, WebcamState, SERVICE_NAME, SERVICE_PATH,
 };
+use webcam::WebcamBridge;
 use windows::WindowManager;
 
 /// How often finished scrcpy processes are collected.
@@ -53,7 +55,13 @@ struct State {
     /// Cached per device. Listing takes seconds, and the menu is opened far
     /// more often than apps are installed.
     apps: HashMap<String, Vec<App>>,
+    /// Cached like the app list, and for the same reason: enumerating sensor
+    /// modes takes seconds. Camera hardware does not change while a phone is
+    /// plugged in, so this only needs dropping when the device leaves.
+    cameras: HashMap<String, Vec<Camera>>,
     windows: WindowManager,
+    /// At most one stream: a V4L2 device takes a single producer.
+    webcam: WebcamBridge,
     registry: Registry,
 }
 
@@ -218,6 +226,96 @@ impl ConnectService {
         removed
     }
 
+    /// The cameras on a device.
+    ///
+    /// Cached: the phone has to walk every sensor mode to answer, which takes
+    /// seconds, and a picker that stalls each time it opens is worse than one
+    /// that shows slightly stale hardware — which cannot change anyway while
+    /// the same phone is plugged in.
+    async fn list_cameras(&self, serial: &str, refresh: bool) -> Result<Vec<Camera>, FdoError> {
+        {
+            let state = self.state.lock().await;
+            let device = state.device(serial)?;
+            if device.state != DeviceState::Ready {
+                return Err(FdoError::Failed(format!(
+                    "el dispositivo está {}",
+                    device.state.as_str()
+                )));
+            }
+            if !refresh {
+                if let Some(cached) = state.cameras.get(serial) {
+                    return Ok(cached.clone());
+                }
+            }
+        }
+
+        // Lock released while scrcpy asks the phone, for the same reason as the
+        // app list: holding it would freeze the panel for the whole call.
+        let cameras = webcam::list_cameras(serial)
+            .await
+            .map_err(|err| FdoError::Failed(err.to_string()))?;
+
+        let mut state = self.state.lock().await;
+        state.cameras.insert(serial.to_string(), cameras.clone());
+        Ok(cameras)
+    }
+
+    /// Starts feeding a phone camera into the loopback device.
+    ///
+    /// Returns the device path other applications should open. `size` may be
+    /// empty to let the phone choose, and `fps` may be 0 for the same reason;
+    /// both should otherwise come from [`ConnectService::list_cameras`], since
+    /// a mode the sensor does not have makes the stream die on start.
+    async fn start_webcam(
+        &self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+        serial: &str,
+        camera_id: &str,
+        size: &str,
+        fps: u32,
+    ) -> Result<String, FdoError> {
+        let mut state = self.state.lock().await;
+        let device = state.device(serial)?.clone();
+
+        if device.state != DeviceState::Ready {
+            return Err(FdoError::Failed(format!(
+                "el dispositivo está {}",
+                device.state.as_str()
+            )));
+        }
+
+        let path = state
+            .webcam
+            .start(serial, camera_id, size, fps)
+            .map_err(|err| FdoError::Failed(err.to_string()))?;
+
+        let announced = state.webcam.state();
+        drop(state);
+        let _ = ConnectService::webcam_changed(&emitter, announced).await;
+        Ok(path)
+    }
+
+    /// Stops the stream, if there is one.
+    async fn stop_webcam(&self, #[zbus(signal_emitter)] emitter: SignalEmitter<'_>) -> bool {
+        let mut state = self.state.lock().await;
+        let stopped = state.webcam.stop().await;
+        if stopped {
+            let announced = state.webcam.state();
+            drop(state);
+            let _ = ConnectService::webcam_changed(&emitter, announced).await;
+        }
+        stopped
+    }
+
+    /// What the webcam bridge is doing, and whether it could run at all.
+    ///
+    /// The loopback path is reported even when nothing is streaming: an empty
+    /// one means the kernel module is missing, and a settings screen has to be
+    /// able to say that *before* somebody presses a button that cannot work.
+    async fn webcam_state(&self) -> WebcamState {
+        self.state.lock().await.webcam.state()
+    }
+
     #[zbus(signal)]
     async fn device_added(emitter: &SignalEmitter<'_>, device: Device) -> zbus::Result<()>;
 
@@ -230,6 +328,15 @@ impl ConnectService {
     #[zbus(signal)]
     async fn app_closed(emitter: &SignalEmitter<'_>, serial: &str, package: &str)
         -> zbus::Result<()>;
+
+    /// The bridge started, stopped, or died on its own.
+    ///
+    /// The last case is why this is a signal and not just a return value: the
+    /// phone locking or another app grabbing the camera ends the stream with
+    /// nobody having asked, and a panel showing "streaming" forever after is
+    /// the bug this prevents.
+    #[zbus(signal)]
+    async fn webcam_changed(emitter: &SignalEmitter<'_>, state: WebcamState) -> zbus::Result<()>;
 }
 
 fn now_iso8601() -> String {
@@ -349,6 +456,7 @@ async fn refresh_devices(
         // would show a menu for a phone that is gone.
         for serial in &gone {
             state.apps.remove(serial);
+            state.cameras.remove(serial);
         }
     }
 
@@ -385,12 +493,21 @@ async fn refresh_devices(
     }
 
     for serial in gone {
-        let closed = {
+        let (closed, webcam_stopped, webcam) = {
             let mut state = state.lock().await;
-            state.windows.stop_all(&serial).await
+            let closed = state.windows.stop_all(&serial).await;
+            // The stream would die on its own once scrcpy noticed, but until
+            // then the bridge still reports itself busy and the next `start`
+            // would be refused for a phone that is no longer here.
+            let stopped = state.webcam.stop_if_device(&serial).await;
+            let announced = state.webcam.state();
+            (closed, stopped, announced)
         };
         for package in closed {
             let _ = ConnectService::app_closed(emitter, &serial, &package).await;
+        }
+        if webcam_stopped {
+            let _ = ConnectService::webcam_changed(emitter, webcam).await;
         }
         info!(%serial, "teléfono desconectado");
         let _ = ConnectService::device_removed(emitter, &serial).await;
@@ -415,7 +532,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(Mutex::new(State {
         devices: HashMap::new(),
         apps: HashMap::new(),
+        cameras: HashMap::new(),
         windows: WindowManager::default(),
+        webcam: WebcamBridge::default(),
         registry: Registry::load(),
     }));
 
@@ -471,9 +590,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             _ = reaper.tick() => {
-                let (finished, settling) = {
+                let (finished, webcam_ended, webcam, settling) = {
                     let mut state = state.lock().await;
                     let finished = state.windows.reap();
+                    // The camera can end without anybody asking: the phone
+                    // locks, or another app on it grabs the sensor. Nothing
+                    // else would notice, and the panel would show a stream
+                    // that stopped minutes ago.
+                    let webcam_ended = state.webcam.reap();
+                    let webcam = state.webcam.state();
                     // Tapping "Allow USB debugging" on the phone produces no
                     // udev event: the USB device does not re-enumerate, only
                     // adb's answer changes. So a device left in a transient
@@ -483,12 +608,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let settling = state.devices.values().any(|device| {
                         matches!(device.state, DeviceState::Unauthorized | DeviceState::Connecting)
                     });
-                    (finished, settling)
+                    (finished, webcam_ended, webcam, settling)
                 };
 
                 for (serial, package) in finished {
                     debug!(%serial, %package, "la ventana se cerró");
                     let _ = ConnectService::app_closed(&emitter, &serial, &package).await;
+                }
+
+                if webcam_ended {
+                    debug!("la cámara se cerró sola");
+                    let _ = ConnectService::webcam_changed(&emitter, webcam).await;
                 }
 
                 // Only while something is in flight. With every device ready —

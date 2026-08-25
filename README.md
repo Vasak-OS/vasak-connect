@@ -46,7 +46,14 @@ configuración personal. Nada de eso necesita root ni polkit.
 |---|---|
 | `android-tools` | el `adb` que habla con el teléfono |
 | `scrcpy` ≥ 3.0 | los displays virtuales (`--new-display`) |
+| `v4l2loopback` | el dispositivo donde se escribe la cámara (webcam) |
 | Android | probado en 15; los displays virtuales necesitan una versión reciente |
+
+El módulo `v4l2loopback` lo provee el propio kernel en varias distribuciones
+—los kernels de CachyOS lo traen compilado— y en el resto sale de
+`v4l2loopback-dkms`. Por eso el paquete depende del proveedor virtual
+`V4L2LOOPBACK-MODULE` y no de un paquete concreto: nombrar el de DKMS obligaría
+a recompilar en cada actualización de kernel a quien ya lo tiene.
 
 En el teléfono hace falta **Opciones de desarrollador → Depuración por USB**, y
 aceptar el diálogo la primera vez que lo conectás.
@@ -95,14 +102,62 @@ verdad: el panel y Ajustes dependen de esa crate para no quedar desfasados.
 | `ListRunning` | `() → a(sssu)` | Ventanas abiertas |
 | `SetAlias` | `(s serial, s alias) → b` | Renombra un dispositivo |
 | `ForgetDevice` | `(s serial) → b` | Lo saca de la lista de conocidos |
+| `ListCameras` | `(s serial, b refresh) → a(ssasau)` | Cámaras, con sus tamaños y fps |
+| `StartWebcam` | `(s serial, s camera_id, s size, u fps) → s` | Conecta la cámara; devuelve `/dev/videoN` |
+| `StopWebcam` | `() → b` | Corta el stream |
+| `WebcamState` | `() → (bssss)` | Qué está haciendo el puente |
 
 ### Señales
 
-`DeviceAdded`, `DeviceRemoved`, `DeviceChanged`, `AppClosed`.
+`DeviceAdded`, `DeviceRemoved`, `DeviceChanged`, `AppClosed`, `WebcamChanged`.
 
 `DeviceChanged` es la que importa para el estado: un teléfono aparece como
 `unauthorized` hasta que la persona acepta el diálogo, y pasa a `ready` sin que
 haya que volver a enchufarlo.
+
+`WebcamChanged` existe porque el stream puede terminar sin que nadie lo pida
+—el teléfono se bloquea, u otra app del teléfono se queda con el sensor—, y un
+panel que siga mostrando «transmitiendo» diez minutos después es peor que no
+mostrar nada.
+
+## La cámara como webcam
+
+La cámara del teléfono se puede usar en cualquier aplicación de videollamada.
+scrcpy lee el sensor y escribe los cuadros en un dispositivo `v4l2loopback`;
+Zoom, Firefox u OBS lo ven como una cámara más, llamada **VasakOS Phone**.
+
+```bash
+busctl --user call ar.net.vasak.os.Connect /ar/net/vasak/os/Connect \
+  ar.net.vasak.os.Connect ListCameras sb "TU_SERIAL" false
+
+busctl --user call ar.net.vasak.os.Connect /ar/net/vasak/os/Connect \
+  ar.net.vasak.os.Connect StartWebcam sssu "TU_SERIAL" "0" "1280x720" 30
+```
+
+Tres decisiones que conviene conocer antes de cambiar algo acá:
+
+**El dispositivo se busca por nombre, no por número.** `/dev/video0` es la
+primera cámara que encontró el kernel, que en una notebook es la webcam
+integrada: escribir ahí sería escribir encima de hardware real. El módulo se
+carga con un `card_label` conocido y el demonio lo busca en sysfs, así que el
+número puede ser cualquiera. Ojo: V4L2 trunca la etiqueta a 31 caracteres, y la
+comparación es por igualdad — un nombre más largo no coincidiría con nada.
+
+**El módulo se carga al arrancar, no cuando hace falta.** `modprobe` necesita
+root y este servicio corre en la sesión; pedir una autorización de polkit para
+encender una webcam sería peor que el problema que resuelve. Que esté siempre
+cargado no molesta gracias a `exclusive_caps=1`: con esa opción el dispositivo
+sólo se anuncia como cámara mientras algo esté escribiendo en él. Sin ella,
+todas las aplicaciones de videollamada ofrecerían «VasakOS Phone»
+permanentemente y mostrarían negro a quien la eligiera.
+
+**Un stream a la vez.** Un dispositivo V4L2 admite una sola fuente. Conectar un
+segundo teléfono no agregaría una cámara: corrompería la primera, así que el
+puente es único y lo dice con un error propio.
+
+Los tamaños y los fps salen del teléfono, no de una lista de resoluciones
+comunes: pedir un modo que el sensor no tiene es la forma habitual de que el
+stream abra y se muera medio segundo después.
 
 ## Configuración
 
@@ -145,6 +200,16 @@ cosas que ya sabemos y condicionan cómo se va a hacer:
 - mDNS es link-local: en una red segmentada —una oficina, una universidad— no
   cruza. Por eso el registro guarda `last_address`: reconectar directo es el
   único camino cuando no hay descubrimiento.
+
+**La webcam necesita un reinicio después de actualizar el kernel.** El módulo
+que se instaló es el del kernel nuevo, y el que corre es el viejo; hasta
+reiniciar, `WebcamState` devuelve el dispositivo vacío y `StartWebcam` explica
+por qué. Es el único caso en que la función aparece como no disponible en un
+sistema que la tiene instalada.
+
+**La cámara no trae audio.** El puente pasa vídeo solamente. El micrófono del
+teléfono es un stream aparte y mezclarlo acá significaría decidir por la
+aplicación de videollamada, que ya tiene su propio selector de micrófono.
 
 **El menú lista todo.** 128 aplicaciones en el teléfono de prueba, 39 de ellas
 del sistema. El campo `system` está para que el panel las esconda por defecto,
