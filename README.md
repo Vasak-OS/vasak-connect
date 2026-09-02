@@ -45,7 +45,7 @@ configuración personal. Nada de eso necesita root ni polkit.
 | | |
 |---|---|
 | `android-tools` | el `adb` que habla con el teléfono |
-| `scrcpy` ≥ 3.0 | los displays virtuales (`--new-display`) |
+| `scrcpy` ≥ 4.0 | los displays virtuales (`--new-display`) y que la ventana se pueda redimensionar (`--flex-display`, estrenada en 4.0) |
 | `v4l2loopback` | el dispositivo donde se escribe la cámara (webcam) |
 | Android | probado en 15; los displays virtuales necesitan una versión reciente |
 
@@ -214,6 +214,15 @@ aplicación de videollamada, que ya tiene su propio selector de micrófono.
 **El menú lista todo.** 128 aplicaciones en el teléfono de prueba, 39 de ellas
 del sistema. El campo `system` está para que el panel las esconda por defecto,
 pero falta decidir favoritos y buscador.
+
+**Los elementos de la app se ven chicos.** La ventana se puede agrandar y la app
+se re-acomoda —eso funciona—, pero scrcpy deja la densidad de la pantalla fija al
+redimensionar, así que hay que elegir una sola: a 160 dpi un dp es un píxel y la
+app usa el diseño que le corresponde al tamaño real de la ventana; a una densidad
+más alta los elementos se ven más grandes y la app cree estar en un teléfono por
+más que la ventana ocupe media pantalla. Se eligió lo primero. Tener las dos cosas
+necesita densidad dinámica en scrcpy, que hoy es una propuesta abierta
+([Genymobile/scrcpy#6784](https://github.com/Genymobile/scrcpy/issues/6784)).
 
 **Las ventanas comparten `app_id`.** Cada app es un proceso de scrcpy, y el panel
 probablemente las agrupe todas bajo el mismo icono. Falta ver si se puede fijar
