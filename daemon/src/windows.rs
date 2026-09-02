@@ -14,6 +14,11 @@
 //!   typing here makes the keyboard pop up on the phone.
 //! * `--no-vd-destroy-content` means closing the window sends the app back to
 //!   the phone instead of killing it mid-task.
+//! * `--flex-display` es lo que hace que la ventana se pueda agrandar: scrcpy
+//!   redimensiona la pantalla virtual para que siga al tamaño de la ventana.
+//!   Necesita **scrcpy 4.0 o más nuevo**, donde la opción se estrenó; en 3.x no
+//!   existe y scrcpy sale en el arranque sin abrir ninguna ventana. Por eso el
+//!   paquete pide esa versión y no la 3.0 que alcanzaba para `--new-display`.
 //!
 //! The daemon owns these processes rather than the panel: it is the one
 //! watching udev, so it is the only part that learns about an unplug in time to
@@ -30,6 +35,68 @@ use vasak_connect_protocol::Transport;
 
 /// Identifies an open window: one app on one device.
 pub type WindowKey = (String, String);
+
+/// El tamaño en píxeles con que abre una ventana.
+///
+/// Es sólo el punto de partida —`--flex-display` la sigue desde ahí—, y es
+/// conservador a propósito: entra en una pantalla de portátil de 1366×768 sin
+/// que el compositor tenga que recortarla.
+const ANCHO_INICIAL: u32 = 1000;
+const ALTO_INICIAL: u32 = 700;
+
+/// La densidad de la pantalla virtual, en dpi.
+///
+/// **Esto es lo que decide si la app se re-acomoda al redimensionar la
+/// ventana.** scrcpy sigue el tamaño de la ventana pero deja la densidad fija:
+/// al redimensionar cambia la resolución y nada más. Así que este número decide
+/// para siempre a cuántos dp equivale cada píxel, y Android elige el diseño de
+/// una app por dp, nunca por píxeles.
+///
+/// Con los 220 dpi que había antes, una ventana de 1000×700 le llegaba a
+/// Android como 727×509 dp. El lado menor —509 dp— queda por debajo de los
+/// 600 dp desde donde Android entrega recursos de tablet, así que la app se
+/// dibujaba como en un teléfono y agrandar la ventana no la movía de ahí: para
+/// cruzar el umbral había que pasar los 825 px de alto, más de lo que mide la
+/// mayoría de las ventanas. La pantalla crecía y la app seguía siendo un
+/// teléfono estirado.
+///
+/// A 160 dpi —la densidad base de Android, y la que scrcpy usa por defecto para
+/// estas pantallas— un dp es exactamente un píxel, así que el umbral cae donde
+/// uno lo espera: 600 px de lado menor y la app pasa a diseño de tablet.
+///
+/// El precio es que los elementos se dibujan 1,375 veces más chicos que antes.
+/// No hay forma de tener las dos cosas: una densidad alta agranda los elementos
+/// y a la vez le miente a la app sobre cuánto espacio tiene. Tenerlas juntas
+/// necesita que scrcpy pueda cambiar la densidad al redimensionar, que hoy es
+/// una propuesta abierta (Genymobile/scrcpy#6784).
+const DENSIDAD: u32 = 160;
+
+/// Los dp que mide una cantidad de píxeles a una densidad dada.
+///
+/// Es la cuenta que hace Android para elegir los recursos de una app:
+/// `dp = px × 160 / dpi`. Está en una función para poder afirmarla en un test,
+/// que es lo único que impide que la densidad vuelva a subir sin que nadie note
+/// el efecto — el síntoma no es un error, es una app que se ve bien y se dibuja
+/// como si estuviera en un teléfono.
+fn en_dp(pixeles: u32, densidad: u32) -> u32 {
+    pixeles * 160 / densidad
+}
+
+/// El «smallest width» de Android: el lado menor, en dp.
+///
+/// Es el que gobierna los recursos `sw<N>dp` y no cambia al rotar, así que es el
+/// que decide si una app se dibuja como teléfono o como tablet. Mirar sólo el
+/// ancho es el error fácil: a 220 dpi una ventana de 1000×700 tenía 727 dp de
+/// ancho —suficiente para varios diseños— y aun así quedaba en teléfono, porque
+/// lo que la dejaba afuera era el alto.
+fn menor_lado_dp(ancho: u32, alto: u32, densidad: u32) -> u32 {
+    en_dp(ancho.min(alto), densidad)
+}
+
+/// El argumento con que se le pide a scrcpy la pantalla virtual.
+fn nueva_pantalla(ancho: u32, alto: u32, densidad: u32) -> String {
+    format!("--new-display={ancho}x{alto}/{densidad}")
+}
 
 pub struct Window {
     pub label: String,
@@ -88,7 +155,7 @@ impl WindowManager {
         let mut command = Command::new("scrcpy");
         command
             .args(["-s", serial])
-            .arg("--new-display=1000x700/220")
+            .arg(nueva_pantalla(ANCHO_INICIAL, ALTO_INICIAL, DENSIDAD))
             .arg("--no-vd-system-decorations")
             .arg("--display-ime-policy=local")
             .arg("--no-vd-destroy-content")
@@ -102,13 +169,22 @@ impl WindowManager {
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
 
-        // Over the network the link is both slower and lossier, so the defaults
-        // — tuned for USB — produce a stuttering window.
-        if transport == Transport::Tcp {
-            command
-                .arg("--video-codec=h265")
-                .arg("--video-bit-rate=4M")
-                .arg("--max-fps=30");
+        match transport {
+            // Over the network the link is both slower and lossier, so the
+            // defaults — tuned for USB — produce a stuttering window.
+            Transport::Tcp => {
+                command
+                    .arg("--video-codec=h265")
+                    .arg("--video-bit-rate=4M")
+                    .arg("--max-fps=30");
+            }
+            // Por USB el ancho de banda no es el límite, y ahora la ventana
+            // puede crecer: con los 8 Mb/s que scrcpy trae por defecto, una
+            // ventana grande se ve en bloques. Subirlo es lo que la propia
+            // documentación de scrcpy recomienda para estas pantallas.
+            Transport::Usb => {
+                command.arg("--video-bit-rate=16M");
+            }
         }
 
         let mut child = command.spawn().map_err(|err| {
@@ -122,6 +198,14 @@ impl WindowManager {
         let pid = child.id().unwrap_or(0);
         let stderr = child.stderr.take();
         info!(%serial, %package, pid, "ventana abierta");
+        // En dp, que es la unidad en la que Android decide el diseño de la app.
+        // Se registra porque «la app se ve como en un teléfono» no deja rastro
+        // en ningún log: los píxeles se ven en la pantalla y los dp no.
+        debug!(
+            ancho_dp = en_dp(ANCHO_INICIAL, DENSIDAD),
+            lado_menor_dp = menor_lado_dp(ANCHO_INICIAL, ALTO_INICIAL, DENSIDAD),
+            "tamaño inicial de la pantalla virtual"
+        );
 
         {
             let key = key.clone();
@@ -223,5 +307,77 @@ impl WindowManager {
             }
         });
         gone
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Desde cuántos dp de lado menor Android entrega recursos de tablet: el
+    /// calificador `sw600dp`.
+    const UMBRAL_TABLET_DP: u32 = 600;
+
+    /// Desde cuántos dp de ancho la clase de ventana de Material 3 es
+    /// «expandida», que es donde una app muestra dos paneles en lugar de uno.
+    const UMBRAL_EXPANDIDO_DP: u32 = 840;
+
+    #[test]
+    fn un_pixel_es_un_dp_en_la_densidad_base() {
+        assert_eq!(en_dp(1000, 160), 1000);
+        assert_eq!(en_dp(600, 160), 600);
+    }
+
+    #[test]
+    fn la_ventana_inicial_le_llega_a_android_como_tablet() {
+        assert!(
+            menor_lado_dp(ANCHO_INICIAL, ALTO_INICIAL, DENSIDAD) >= UMBRAL_TABLET_DP,
+            "el lado menor da {} dp",
+            menor_lado_dp(ANCHO_INICIAL, ALTO_INICIAL, DENSIDAD)
+        );
+    }
+
+    #[test]
+    fn y_con_espacio_para_dos_paneles() {
+        assert!(en_dp(ANCHO_INICIAL, DENSIDAD) >= UMBRAL_EXPANDIDO_DP);
+    }
+
+    #[test]
+    fn la_densidad_que_teniamos_dejaba_la_app_en_diseno_de_telefono() {
+        // El bug, tal como se veía: la ventana se agrandaba y la app seguía
+        // dibujándose como en un teléfono. A 220 dpi el ancho alcanzaba de
+        // sobra y el alto no, y manda el lado menor.
+        assert_eq!(en_dp(1000, 220), 727);
+        assert_eq!(menor_lado_dp(1000, 700, 220), 509);
+        assert!(menor_lado_dp(1000, 700, 220) < UMBRAL_TABLET_DP);
+    }
+
+    #[test]
+    fn a_220_dpi_habia_que_pasar_los_825_px_de_alto() {
+        // Que es más de lo que mide la mayoría de las ventanas, y explica por
+        // qué agrandar no cambiaba nada en la práctica.
+        assert!(menor_lado_dp(1400, 824, 220) < UMBRAL_TABLET_DP);
+        assert!(menor_lado_dp(1400, 825, 220) >= UMBRAL_TABLET_DP);
+    }
+
+    #[test]
+    fn ahora_el_umbral_cae_donde_se_lo_espera() {
+        // A la densidad base el umbral está en píxeles redondos: 600 de lado
+        // menor. Es lo que hace que redimensionar sea predecible en lugar de
+        // tener un punto de quiebre que nadie puede adivinar.
+        assert!(menor_lado_dp(1000, 599, DENSIDAD) < UMBRAL_TABLET_DP);
+        assert!(menor_lado_dp(1000, 600, DENSIDAD) >= UMBRAL_TABLET_DP);
+    }
+
+    #[test]
+    fn el_lado_menor_no_es_siempre_el_alto() {
+        // Una ventana más alta que ancha existe —alguien la acomoda al costado
+        // de la pantalla— y ahí el que decide es el ancho.
+        assert_eq!(menor_lado_dp(500, 1200, DENSIDAD), 500);
+    }
+
+    #[test]
+    fn el_argumento_nombra_tamano_y_densidad() {
+        assert_eq!(nueva_pantalla(1000, 700, 160), "--new-display=1000x700/160");
     }
 }
