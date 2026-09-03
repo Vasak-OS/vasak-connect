@@ -10,5 +10,41 @@ ExecStart=/usr/bin/vasak-connect
 Restart=on-failure
 RestartSec=3
 
+# Este servicio ve el teléfono: sus archivos, su cámara, la lista de lo que
+# tiene instalado. Corría sin ninguna restricción, así que se le saca todo lo
+# que no usa.
+#
+# La red es lo primero, y acá sale barato: con el teléfono se habla por USB a
+# través de `adb`, no por red. Queda AF_NETLINK porque es por donde udev avisa
+# que enchufaste o desenchufaste el aparato —sin eso no se entera de nada—.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# `full` y no `strict`: deja /usr, /boot y /etc de sólo lectura, que es de donde
+# vendría un cambio persistente al sistema.
+ProtectSystem=full
+
+# Sin `PrivateDevices` ni `MemoryDenyWriteExecute` a propósito: el primero le
+# escondería /dev/bus/usb y el /dev/video por donde sale la cámara del teléfono,
+# y el segundo lo heredarían los programas que lanza —`adb` entre ellos—, que sí
+# generan código en memoria.
+
 [Install]
 WantedBy=graphical-session.target
