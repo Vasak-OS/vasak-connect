@@ -19,6 +19,26 @@ RestartSec=3
 # que enchufaste o desenchufaste el aparato —sin eso no se entera de nada—.
 RestrictAddressFamilies=AF_UNIX AF_NETLINK
 
+# Y para que eso no rompa `adb`, que es con lo que se habla con el teléfono.
+#
+# Con el teléfono se habla por USB, pero `adb` tiene además un canal propio
+# entre su cliente y su servidor, y por omisión ése es TCP en localhost
+# (tcp:5037). Con la red cerrada, ese canal no se puede abrir y adb falla con
+# «ADB server didn't ACK» —sin decir que el problema es la red—.
+#
+# Comprobado: con la restricción y sin esta variable, adb no arranca; con ella,
+# levanta su servidor en un socket abstracto y funciona igual.
+#
+# Se prefiere esto antes que permitir AF_INET porque este servicio ve los
+# archivos del teléfono y su cámara: dejarle la red abierta para que hable
+# consigo mismo sería un precio alto por una comodidad.
+#
+# El costo está en que este servidor de adb es distinto del que levanta un `adb`
+# corrido a mano en una terminal, y dos servidores se disputan el mismo teléfono.
+# Quien use adb a mano y quiera compartir servidor puede exportar la misma
+# variable.
+Environment=ADB_SERVER_SOCKET=localabstract:vasak-connect-adb
+
 NoNewPrivileges=yes
 CapabilityBoundingSet=
 PrivateTmp=yes
