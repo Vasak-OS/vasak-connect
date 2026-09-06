@@ -17,6 +17,7 @@
 mod adb;
 mod hotplug;
 mod notify;
+mod permiso;
 mod registry;
 mod webcam;
 mod windows;
@@ -274,15 +275,34 @@ impl ConnectService {
         size: &str,
         fps: u32,
     ) -> Result<String, FdoError> {
-        let mut state = self.state.lock().await;
-        let device = state.device(serial)?.clone();
+        // El nombre del teléfono se lee antes de soltar el candado, y el
+        // permiso se pregunta **después** de soltarlo: del otro lado puede
+        // haber una persona leyendo un diálogo, y sostener el candado durante
+        // ese rato dejaría al resto del servicio esperando a que conteste.
+        let (nombre, listo) = {
+            let state = self.state.lock().await;
+            let device = state.device(serial)?.clone();
+            (device.model.clone(), device.state == DeviceState::Ready)
+        };
 
-        if device.state != DeviceState::Ready {
+        if !listo {
+            let state = self.state.lock().await;
+            let device = state.device(serial)?.clone();
             return Err(FdoError::Failed(format!(
                 "el dispositivo está {}",
                 device.state.as_str()
             )));
         }
+
+        // La cámara del teléfono es una cámara que enciende el escritorio, así
+        // que pasa por el mismo permiso que la del equipo: se pregunta una vez,
+        // queda anotada en Privacidad y seguridad, y se puede revocar desde
+        // ahí. Y falla cerrado — si el servicio no contesta, no se enciende.
+        permiso::puede_usar_la_camara(&nombre)
+            .await
+            .map_err(FdoError::AccessDenied)?;
+
+        let mut state = self.state.lock().await;
 
         let path = state
             .webcam
