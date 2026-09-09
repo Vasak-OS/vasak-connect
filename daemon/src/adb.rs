@@ -265,6 +265,131 @@ fn looks_like_package(text: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// Salidas con la forma que `adb devices -l` produce de verdad.
+    ///
+    /// Hace falta un generador y no alcanza con texto al azar: un aparato de
+    /// red necesita un `host:puerto` con puerto que entre en un `u16` y un
+    /// segundo campo con el estado, y la probabilidad de que eso salga de una
+    /// cadena arbitraria es nula. Sin esto, las propiedades sobre el transporte
+    /// y la serie no llegan a mirar nunca la rama que les importa — lo
+    /// comprobé rompiendo el código a propósito y viéndolas pasar igual.
+    fn salida_de_adb() -> impl proptest::strategy::Strategy<Value = String> {
+        use proptest::prelude::*;
+
+        let usb = "[A-Z0-9]{6,12}".prop_map(|s| s.to_string());
+        let tcp = ("[0-9]{1,3}(\\.[0-9]{1,3}){3}", 1u32..70000).prop_map(|(h, p)| format!("{h}:{p}"));
+        let id = prop_oneof![usb, tcp];
+
+        let estado = prop_oneof![
+            Just("device".to_string()),
+            Just("unauthorized".to_string()),
+            Just("offline".to_string()),
+            "[a-z]{3,12}".prop_map(|s| s.to_string()),
+        ];
+
+        let extras = proptest::option::of("model:[A-Za-z0-9_]{1,20}".prop_map(|s| s.to_string()));
+
+        let linea = (id, estado, extras).prop_map(|(id, estado, extras)| match extras {
+            Some(e) => format!("{id} {estado} {e}"),
+            None => format!("{id} {estado}"),
+        });
+
+        proptest::collection::vec(linea, 0..5)
+            .prop_map(|lineas| format!("List of devices attached\n{}\n", lineas.join("\n")))
+    }
+
+    // Parte del fuzzing de los analizadores privilegiados que pide
+    // Vasak-OS/website#5. Éste es el que lee **desde afuera del equipo**: el
+    // número de serie, el nombre del modelo y los nombres de paquete los elige
+    // el teléfono, y con `adb connect` el teléfono puede estar en cualquier
+    // parte de la red.
+    proptest::proptest! {
+        /// Ninguna salida, venga como venga, hace caer a los analizadores.
+        #[test]
+        fn parse_devices_nunca_entra_en_panico(texto in ".{0,400}") {
+            let _ = parse_devices(&texto);
+        }
+
+        #[test]
+        fn parse_apps_nunca_entra_en_panico(texto in ".{0,400}") {
+            let _ = parse_apps(&texto);
+        }
+
+        /// Ni una salida con la forma de `adb devices -l` y los campos al
+        /// voleo, que es lo que una cadena al azar casi nunca produce.
+        #[test]
+        fn una_linea_con_forma_de_dispositivo_tampoco(
+            id in ".{0,40}",
+            estado in ".{0,20}",
+            modelo in ".{0,40}",
+        ) {
+            let salida = format!("List of devices attached\n{id} {estado} model:{modelo}\n");
+            let _ = parse_devices(&salida);
+        }
+
+        /// El número de serie nunca sale vacío.
+        ///
+        /// Todo se indexa por serie: el registro de confiados, las ventanas
+        /// abiertas, la cámara. Dos aparatos con la serie vacía serían el mismo
+        /// para todo el servicio, y confiar en uno confiaría en el otro.
+        ///
+        /// Va con el generador de líneas armadas y no con texto al azar. Con
+        /// texto al azar esta prueba **pasaba con el error puesto**: hace falta
+        /// un `host:puerto` con puerto válido y un segundo campo para producir
+        /// un aparato de red, y eso no sale de `.{0,300}` ni por casualidad.
+        #[test]
+        fn la_serie_nunca_queda_vacia(salida in salida_de_adb()) {
+            for dispositivo in parse_devices(&salida) {
+                proptest::prop_assert!(!dispositivo.serial.is_empty(), "{salida:?}");
+            }
+        }
+
+        /// Lo que llega por red trae dirección; lo que llega por cable, no.
+        ///
+        /// De eso depende a dónde se reconecta el servicio. Una dirección vacía
+        /// en un aparato marcado como de red haría que intente `adb connect ""`.
+        #[test]
+        fn el_transporte_y_la_direccion_van_juntos(salida in salida_de_adb()) {
+            for dispositivo in parse_devices(&salida) {
+                match dispositivo.transport {
+                    Transport::Tcp => proptest::prop_assert!(!dispositivo.address.is_empty()),
+                    Transport::Usb => proptest::prop_assert!(dispositivo.address.is_empty()),
+                }
+            }
+        }
+
+        /// Todo paquete que sale de acá tiene forma de paquete.
+        ///
+        /// Es la propiedad que importa de las tres. El nombre se interpola en
+        /// un argumento de scrcpy —`--start-app=+{package}` en `windows.rs`—,
+        /// así que lo que salga de este analizador termina en la línea de
+        /// órdenes de otro programa. No hay shell de por medio, con lo cual no
+        /// hay inyección posible, pero que el juego de caracteres esté acotado
+        /// a letras, números, punto, guion y guion bajo es lo que hace que eso
+        /// siga siendo cierto si alguien cambia cómo se arma esa orden.
+        #[test]
+        fn todo_paquete_tiene_forma_de_paquete(texto in ".{0,400}") {
+            for (paquete, _, _) in parse_apps(&texto) {
+                proptest::prop_assert!(looks_like_package(&paquete), "{paquete:?}");
+            }
+        }
+
+        /// Y una etiqueta nunca se cuela como paquete.
+        ///
+        /// Emparejar mal el par etiqueta/paquete significa lanzar una
+        /// aplicación distinta de la que se tocó en el menú.
+        #[test]
+        fn una_etiqueta_con_espacios_no_pasa_por_paquete(
+            etiqueta in "[a-zA-Z ]{1,30}",
+            paquete in "[a-z]{1,8}\\.[a-z]{1,8}",
+        ) {
+            let salida = format!(" * {etiqueta} {paquete}\n");
+            for (p, _, _) in parse_apps(&salida) {
+                proptest::prop_assert_eq!(&p, &paquete);
+            }
+        }
+    }
+
     #[test]
     fn reads_a_usb_device() {
         let out = "List of devices attached\n\

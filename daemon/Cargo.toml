@@ -20,3 +20,9 @@ udev = "0.9"
 libc = "0.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+# Pruebas de propiedad sobre lo que devuelven `adb` y `scrcpy`. Es lo único de
+# este servicio que interpreta texto que viene de un aparato ajeno: el nombre
+# del modelo, el número de serie y los nombres de paquete los elige el teléfono.
+proptest = "1"
