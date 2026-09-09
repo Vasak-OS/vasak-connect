@@ -277,8 +277,19 @@ mod tests {
         use proptest::prelude::*;
 
         let usb = "[A-Z0-9]{6,12}".prop_map(|s| s.to_string());
-        let tcp = ("[0-9]{1,3}(\\.[0-9]{1,3}){3}", 1u32..70000).prop_map(|(h, p)| format!("{h}:{p}"));
-        let id = prop_oneof![usb, tcp];
+        // Puertos que entran en un `u16`, que son los que `parse_devices`
+        // reconoce como red. El `..70000` de antes generaba también puertos
+        // imposibles, y ésos caen por la rama de USB: eran casos que no
+        // ejercitaban lo que esta rama del generador quería ejercitar.
+        let tcp = ("[0-9]{1,3}(\\.[0-9]{1,3}){3}", 1u32..=u16::MAX as u32)
+            .prop_map(|(h, p)| format!("{h}:{p}"));
+        // Y uno que **parece** de red y no lo es: mismo aspecto, puerto fuera
+        // de rango. Se genera aparte y a propósito, porque es justo el caso que
+        // el generador anterior producía sin querer y con el que hay que
+        // contar: tiene que salir como USB, con su serie y sin dirección.
+        let casi_tcp = ("[0-9]{1,3}(\\.[0-9]{1,3}){3}", 65536u32..99999)
+            .prop_map(|(h, p)| format!("{h}:{p}"));
+        let id = prop_oneof![usb, tcp, casi_tcp];
 
         let estado = prop_oneof![
             Just("device".to_string()),
