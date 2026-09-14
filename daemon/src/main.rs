@@ -24,7 +24,7 @@ mod windows;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::Mutex;
 use tokio::time::{interval, sleep};
@@ -47,6 +47,25 @@ use windows::WindowManager;
 /// second in a service that is otherwise idle is exactly the cost this project
 /// has been removing elsewhere.
 const REAP_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Cuánto se le da a scrcpy para fracasar antes de dar el arranque por bueno.
+///
+/// Medido contra un motorola edge 40 por USB: un modo que el codificador del
+/// teléfono no puede configurar muere a los **2,5 s** —scrcpy tiene que empujar
+/// su servidor, abrir la cámara y recién ahí configurar el codificador—, y un
+/// túnel que no levanta tarda **7 s** en darse por vencido. Tres segundos cubren
+/// el primero, que es el que queda una vez arreglado el segundo.
+///
+/// No más, porque es tiempo que paga **cada** arranque que sí funciona: el
+/// fallo contesta apenas ocurre, pero el caso bueno espera hasta el final para
+/// poder decir que sí.
+const ESPERA_DE_ARRANQUE: Duration = Duration::from_secs(3);
+
+/// Cada cuánto se mira si scrcpy sigue vivo durante esa espera.
+///
+/// Se mira varias veces en lugar de dormir la espera entera de un saque: así un
+/// fallo contesta cuando ocurre y no cuando se acaba el plazo.
+const PASO_DE_ESPERA: Duration = Duration::from_millis(250);
 
 /// After udev reports a device, adb needs a moment before it lists it.
 const SETTLE: Duration = Duration::from_millis(600);
@@ -304,10 +323,36 @@ impl ConnectService {
 
         let mut state = self.state.lock().await;
 
-        let path = state
+        let (path, intento) = state
             .webcam
             .start(serial, camera_id, size, fps)
             .map_err(|err| FdoError::Failed(err.to_string()))?;
+        drop(state);
+
+        // `spawn` contesta que sí mucho antes de que haya cámara: scrcpy todavía
+        // tiene que empujar su servidor al teléfono, y el arranque que fracasa
+        // fracasa después. Sin esta espera la llamada devolvía la ruta del
+        // dispositivo igual, así que quien la hizo no tenía error que mostrar y
+        // el interruptor se apagaba solo un par de segundos más tarde.
+        //
+        // El candado va suelto durante la espera, por lo mismo que el permiso se
+        // pregunta con el candado suelto: sostenerlo deja al resto del servicio
+        // esperando, y acá adentro está el recolector, que corre cada dos
+        // segundos.
+        let limite = Instant::now() + ESPERA_DE_ARRANQUE;
+        loop {
+            sleep(PASO_DE_ESPERA).await;
+
+            let mut state = self.state.lock().await;
+            if let Some(motivo) = state.webcam.murio_al_arrancar(intento) {
+                return Err(FdoError::Failed(motivo));
+            }
+            if Instant::now() >= limite {
+                break;
+            }
+        }
+
+        let state = self.state.lock().await;
 
         let announced = state.webcam.state();
         drop(state);
@@ -346,8 +391,11 @@ impl ConnectService {
     async fn device_changed(emitter: &SignalEmitter<'_>, device: Device) -> zbus::Result<()>;
 
     #[zbus(signal)]
-    async fn app_closed(emitter: &SignalEmitter<'_>, serial: &str, package: &str)
-        -> zbus::Result<()>;
+    async fn app_closed(
+        emitter: &SignalEmitter<'_>,
+        serial: &str,
+        package: &str,
+    ) -> zbus::Result<()>;
 
     /// The bridge started, stopped, or died on its own.
     ///
@@ -543,9 +591,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the first version of this shipped with an empty journal.
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                format!("{}=info", env!("CARGO_CRATE_NAME")).into()
-            }),
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| format!("{}=info", env!("CARGO_CRATE_NAME")).into()),
         )
         .init();
 
@@ -560,7 +607,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let connection = connection::Builder::session()?
         .name(SERVICE_NAME)?
-        .serve_at(SERVICE_PATH, ConnectService { state: state.clone() })?
+        .serve_at(
+            SERVICE_PATH,
+            ConnectService {
+                state: state.clone(),
+            },
+        )?
         .build()
         .await?;
 
