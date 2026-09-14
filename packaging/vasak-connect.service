@@ -14,24 +14,49 @@ RestartSec=3
 # tiene instalado. Corría sin ninguna restricción, así que se le saca todo lo
 # que no usa.
 #
-# La red es lo primero, y acá sale barato: con el teléfono se habla por USB a
-# través de `adb`, no por red. Queda AF_NETLINK porque es por donde udev avisa
-# que enchufaste o desenchufaste el aparato —sin eso no se entera de nada—.
-RestrictAddressFamilies=AF_UNIX AF_NETLINK
+# AF_NETLINK es por donde udev avisa que enchufaste o desenchufaste el aparato:
+# sin eso no se entera de nada.
+#
+# AF_INET y AF_INET6 están porque **scrcpy no puede trabajar sin sockets IP**, y
+# de acá salen la cámara del teléfono y las ventanas de aplicaciones. Esta lista
+# llegó a ser sólo `AF_UNIX AF_NETLINK`, y con eso ninguna de las dos funcionó
+# nunca.
+#
+# El razonamiento que faltaba: es cierto que con el teléfono se habla por USB, y
+# es cierto que el canal entre cliente y servidor de `adb` se resuelve con el
+# socket abstracto de más abajo. Pero **scrcpy tiene además un túnel propio**, y
+# ése es TCP sobre loopback en sus dos modos —`adb reverse`, que es el de
+# omisión, y `adb forward`—. Con la familia cerrada falla así, y el mensaje no
+# nombra a la restricción por ningún lado:
+#
+#     adb: error: cannot bind listener: Address family not supported by protocol
+#     ERROR: Server connection failed
+#
+# `Address family not supported by protocol` es `EAFNOSUPPORT`, que es lo que
+# devuelve `socket()` bajo esta directiva.
+#
+# Lo que se probó para no tener que abrirla, y por qué no alcanzó:
+#
+#   * `IPAddressDeny=any` con `IPAddressAllow=localhost` dejaría pasar sólo
+#     loopback, que es todo lo que scrcpy usa. En unidades de **usuario** se
+#     ignora en silencio: comprobado, con las dos puestas la salida a internet
+#     siguió abierta. Aparenta un límite que no existe, que es peor que no
+#     ponerlo.
+#   * `PrivateNetwork=yes` sí anda en unidad de usuario —loopback propio,
+#     internet inalcanzable— y sería estrictamente mejor. Queda pendiente de
+#     comprobar que no rompa la detección automática: los uevents de udev no se
+#     entregan a un espacio de red que no sea el inicial, que es por lo que udev
+#     no anda dentro de contenedores. Si eso pasa, enchufar el teléfono deja de
+#     notarse, y sería cambiar un fallo por otro.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
 
-# Y para que eso no rompa `adb`, que es con lo que se habla con el teléfono.
+# El canal entre el cliente y el servidor de `adb` va por un socket abstracto y
+# no por TCP.
 #
-# Con el teléfono se habla por USB, pero `adb` tiene además un canal propio
-# entre su cliente y su servidor, y por omisión ése es TCP en localhost
-# (tcp:5037). Con la red cerrada, ese canal no se puede abrir y adb falla con
-# «ADB server didn't ACK» —sin decir que el problema es la red—.
-#
-# Comprobado: con la restricción y sin esta variable, adb no arranca; con ella,
-# levanta su servidor en un socket abstracto y funciona igual.
-#
-# Se prefiere esto antes que permitir AF_INET porque este servicio ve los
-# archivos del teléfono y su cámara: dejarle la red abierta para que hable
-# consigo mismo sería un precio alto por una comodidad.
+# Esto ya no hace falta para que `adb` arranque —AF_INET está permitido—, pero se
+# conserva: el servidor queda fuera del alcance de cualquier cosa que ande
+# mirando `tcp:5037` en la máquina, y una sesión gráfica tiene programas que lo
+# hacen.
 #
 # El costo está en que este servidor de adb es distinto del que levanta un `adb`
 # corrido a mano en una terminal, y dos servidores se disputan el mismo teléfono.
