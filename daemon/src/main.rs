@@ -48,6 +48,15 @@ use windows::WindowManager;
 /// has been removing elsewhere.
 const REAP_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Cuánto se le da a scrcpy para fracasar antes de dar el arranque por bueno.
+///
+/// Los fallos habituales —la cámara tomada por otra aplicación del teléfono, un
+/// modo que el sensor no tiene, el teléfono bloqueado— se ven acá: scrcpy revisa
+/// los argumentos y el estado del teléfono antes de abrir la cámara. Alargar
+/// esto no alcanza a cubrir los que tardan más y sí retrasa cada arranque bueno,
+/// porque es tiempo que se espera siempre.
+const ESPERA_DE_ARRANQUE: Duration = Duration::from_millis(1500);
+
 /// After udev reports a device, adb needs a moment before it lists it.
 const SETTLE: Duration = Duration::from_millis(600);
 
@@ -308,6 +317,24 @@ impl ConnectService {
             .webcam
             .start(serial, camera_id, size, fps)
             .map_err(|err| FdoError::Failed(err.to_string()))?;
+        drop(state);
+
+        // `spawn` contesta que sí mucho antes de que haya cámara: scrcpy todavía
+        // tiene que empujar su servidor al teléfono, y el arranque que fracasa
+        // fracasa después. Sin esta espera la llamada devolvía la ruta del
+        // dispositivo igual, así que quien la hizo no tenía error que mostrar y
+        // el interruptor se apagaba solo un par de segundos más tarde.
+        //
+        // El candado va suelto durante la espera, por lo mismo que el permiso se
+        // pregunta con el candado suelto: sostenerlo deja al resto del servicio
+        // esperando, y acá adentro está el recolector, que corre cada dos
+        // segundos.
+        sleep(ESPERA_DE_ARRANQUE).await;
+
+        let mut state = self.state.lock().await;
+        if let Some(motivo) = state.webcam.murio_al_arrancar(serial) {
+            return Err(FdoError::Failed(motivo));
+        }
 
         let announced = state.webcam.state();
         drop(state);
@@ -346,8 +373,11 @@ impl ConnectService {
     async fn device_changed(emitter: &SignalEmitter<'_>, device: Device) -> zbus::Result<()>;
 
     #[zbus(signal)]
-    async fn app_closed(emitter: &SignalEmitter<'_>, serial: &str, package: &str)
-        -> zbus::Result<()>;
+    async fn app_closed(
+        emitter: &SignalEmitter<'_>,
+        serial: &str,
+        package: &str,
+    ) -> zbus::Result<()>;
 
     /// The bridge started, stopped, or died on its own.
     ///
@@ -543,9 +573,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the first version of this shipped with an empty journal.
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                format!("{}=info", env!("CARGO_CRATE_NAME")).into()
-            }),
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| format!("{}=info", env!("CARGO_CRATE_NAME")).into()),
         )
         .init();
 
@@ -560,7 +589,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let connection = connection::Builder::session()?
         .name(SERVICE_NAME)?
-        .serve_at(SERVICE_PATH, ConnectService { state: state.clone() })?
+        .serve_at(
+            SERVICE_PATH,
+            ConnectService {
+                state: state.clone(),
+            },
+        )?
         .build()
         .await?;
 

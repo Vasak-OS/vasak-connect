@@ -26,6 +26,7 @@
 
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::process::{Child, Command};
@@ -265,17 +266,64 @@ pub async fn list_cameras(serial: &str) -> Result<Vec<Camera>, WebcamError> {
     Ok(parse_cameras(&String::from_utf8_lossy(&output.stdout)))
 }
 
+/// Se queda leyendo la salida de error de scrcpy y la deja donde se la pueda
+/// consultar después.
+///
+/// Hay que leerla mientras el proceso corre: una tubería que nadie vacía
+/// termina trabando a quien escribe. Y se guarda en vez de registrarse acá
+/// mismo, porque en esta tarea no se sabe cómo terminó el proceso, y sin eso no
+/// hay forma de elegir el nivel — adb escribe el progreso de su push por el
+/// mismo lado, así que registrarlo siempre convertiría cada arranque bueno en
+/// una advertencia. Quien sí sabe el estado de salida es [`WebcamBridge::reap`].
+fn recoger_queja(stderr: Option<tokio::process::ChildStderr>) -> Arc<Mutex<String>> {
+    let queja = Arc::new(Mutex::new(String::new()));
+    let recoge = Arc::clone(&queja);
+
+    tokio::spawn(async move {
+        if let Some(stderr) = stderr {
+            use tokio::io::AsyncReadExt;
+            let mut reader = tokio::io::BufReader::new(stderr);
+            let mut texto = String::new();
+            let _ = reader.read_to_string(&mut texto).await;
+            if let Ok(mut guardado) = recoge.lock() {
+                *guardado = texto.trim().to_string();
+            }
+        }
+    });
+
+    queja
+}
+
 struct Running {
     serial: String,
     camera_id: String,
     size: String,
     child: Child,
+    /// Lo que scrcpy escribió por su salida de error, que es donde explica por
+    /// qué no pudo abrir la cámara.
+    ///
+    /// Compartido porque lo llena una tarea aparte: la salida hay que leerla
+    /// mientras el proceso corre —una tubería que nadie vacía termina
+    /// trabando a quien escribe— y quien pregunta por el motivo es otro.
+    queja: Arc<Mutex<String>>,
 }
+
+/// Lo que se contesta cuando el proceso se murió sin dejar dicho por qué.
+const MOTIVO_DESCONOCIDO: &str = "scrcpy terminó apenas arrancó, sin decir por qué";
 
 /// The single camera stream, if there is one.
 #[derive(Default)]
 pub struct WebcamBridge {
     running: Option<Running>,
+    /// Por qué terminó mal el último stream.
+    ///
+    /// Lo deja [`WebcamBridge::reap`] y lo retira
+    /// [`WebcamBridge::murio_al_arrancar`]. Hace falta guardarlo porque los dos
+    /// pueden ver el mismo final: el recolector corre cada dos segundos y la
+    /// comprobación de arranque espera menos que eso, así que cuál de los dos
+    /// llega primero no está decidido. El que llegue segundo encuentra el
+    /// proceso ya juntado, y sin esto se quedaría sin nada que contestar.
+    ultimo_fallo: Option<String>,
 }
 
 impl WebcamBridge {
@@ -374,31 +422,54 @@ impl WebcamBridge {
         let stderr = child.stderr.take();
         info!(%serial, %camera_id, %device, "cámara conectada");
 
-        tokio::spawn(async move {
-            if let Some(stderr) = stderr {
-                // Kept at debug for the same reason as the app windows: adb
-                // writes its push progress here, so treating the stream as
-                // errors turns every normal start into a warning. A real
-                // failure surfaces through `reap`, which sees the exit status.
-                use tokio::io::AsyncReadExt;
-                let mut reader = tokio::io::BufReader::new(stderr);
-                let mut text = String::new();
-                let _ = reader.read_to_string(&mut text).await;
-                let text = text.trim();
-                if !text.is_empty() {
-                    debug!("scrcpy (cámara): {text}");
-                }
-            }
-        });
+        // Un arranque nuevo no hereda el motivo del anterior: contestarlo sería
+        // explicar este fallo con el de la vez pasada.
+        self.ultimo_fallo = None;
+
+        let queja = recoger_queja(stderr);
 
         self.running = Some(Running {
             serial: serial.to_string(),
             camera_id: camera_id.to_string(),
             size: size.to_string(),
             child,
+            queja,
         });
 
         Ok(device)
+    }
+
+    /// Si el arranque no llegó a sostenerse, por qué.
+    ///
+    /// Se pregunta un momento después de [`WebcamBridge::start`], porque scrcpy
+    /// contesta a `spawn` mucho antes de saber si la cámara abrió: empuja su
+    /// servidor al teléfono y recién ahí falla. Sin esto, un arranque fallido se
+    /// anunciaba como bueno —la llamada devolvía la ruta del dispositivo— y el
+    /// interruptor se apagaba solo un par de segundos después sin decir nada.
+    ///
+    /// `None` significa que sigue transmitiendo.
+    pub fn murio_al_arrancar(&mut self, serial: &str) -> Option<String> {
+        match self.running.as_ref() {
+            // Hay una cámara prendida y es de otro teléfono: entre medio alguien
+            // apagó ésta y prendió aquélla. No es este arranque el que falló.
+            Some(running) if running.serial != serial => return None,
+            Some(_) => {
+                self.reap();
+                if self.running.is_some() {
+                    return None;
+                }
+            }
+            // Ya no está: lo juntó el recolector, o lo apagaron desde otro lado.
+            // En cualquiera de los dos casos no quedó cámara transmitiendo, que
+            // es lo que se vino a preguntar.
+            None => {}
+        }
+
+        Some(
+            self.ultimo_fallo
+                .take()
+                .unwrap_or_else(|| MOTIVO_DESCONOCIDO.to_string()),
+        )
     }
 
     /// Stops the stream. Returns whether there was one.
@@ -436,6 +507,15 @@ impl WebcamBridge {
         };
         match running.child.try_wait() {
             Ok(Some(status)) => {
+                // La queja sólo se registra —y sólo se guarda— cuando terminó
+                // mal. En un final normal es el progreso del push de adb, que
+                // como advertencia sería ruido en cada uso.
+                let queja = running
+                    .queja
+                    .lock()
+                    .map(|texto| texto.clone())
+                    .unwrap_or_default();
+
                 if !status.success() {
                     warn!(
                         serial = %running.serial,
@@ -443,13 +523,24 @@ impl WebcamBridge {
                          `scrcpy -s {} --video-source=camera --camera-id={} --v4l2-sink=…` a mano",
                         running.serial, running.camera_id
                     );
+                    if queja.is_empty() {
+                        self.ultimo_fallo = Some(format!("scrcpy terminó con {status}"));
+                    } else {
+                        warn!("scrcpy (cámara): {queja}");
+                        self.ultimo_fallo = Some(queja);
+                    }
+                } else if !queja.is_empty() {
+                    debug!("scrcpy (cámara): {queja}");
                 }
+
                 self.running = None;
                 true
             }
             Ok(None) => false,
             Err(err) => {
                 warn!(%err, "no se pudo consultar el proceso de la cámara, se descarta");
+                self.ultimo_fallo =
+                    Some(format!("no se pudo consultar el proceso de scrcpy: {err}"));
                 self.running = None;
                 true
             }
@@ -458,8 +549,118 @@ impl WebcamBridge {
 }
 
 #[cfg(test)]
+impl WebcamBridge {
+    /// Un puente con un proceso cualquiera haciendo de scrcpy.
+    ///
+    /// Los fallos que importan acá son los del proceso —murió apenas arrancó,
+    /// escribió el motivo por la salida de error, lo juntó el recolector
+    /// primero— y ninguno necesita un teléfono: alcanza con un `sh` que haga lo
+    /// mismo. Pasa por `recoger_queja`, que es el código real.
+    fn de_prueba(serial: &str, guion: &str) -> Self {
+        let mut child = Command::new("sh")
+            .args(["-c", guion])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("no se pudo lanzar el proceso de prueba");
+
+        let queja = recoger_queja(child.stderr.take());
+
+        Self {
+            running: Some(Running {
+                serial: serial.to_string(),
+                camera_id: "0".to_string(),
+                size: String::new(),
+                child,
+                queja,
+            }),
+            ultimo_fallo: None,
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Lo que scrcpy escribe al fallar tiene que llegar a quien pidió la
+    /// cámara. Es la diferencia entre «no prendió» y «la cámara está en uso».
+    #[tokio::test]
+    async fn un_arranque_que_muere_contesta_con_lo_que_dijo_scrcpy() {
+        let mut bridge = WebcamBridge::de_prueba("ZY22", "echo 'Camera not found' >&2; exit 1");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        let motivo = bridge
+            .murio_al_arrancar("ZY22")
+            .expect("murió, así que tiene que haber motivo");
+        assert!(motivo.contains("Camera not found"), "motivo: {motivo}");
+    }
+
+    /// El caso bueno no puede quedar contestado como un fallo.
+    #[tokio::test]
+    async fn un_arranque_que_sigue_vivo_no_es_un_fallo() {
+        let mut bridge = WebcamBridge::de_prueba("ZY22", "sleep 30");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        assert!(bridge.murio_al_arrancar("ZY22").is_none());
+        assert!(bridge.state().active);
+    }
+
+    /// El recolector corre cada dos segundos y la espera de arranque es más
+    /// corta, pero nada garantiza el orden: si el recolector llega primero se
+    /// encuentra con el proceso ya juntado. Sin el motivo guardado, ese camino
+    /// contestaba un fallo sin explicación — que es el mismo silencio que esto
+    /// viene a sacar.
+    #[tokio::test]
+    async fn el_motivo_sobrevive_a_que_lo_junte_el_recolector() {
+        let mut bridge = WebcamBridge::de_prueba("ZY22", "echo 'Encoder error' >&2; exit 2");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        assert!(bridge.reap(), "el recolector tendría que haberlo juntado");
+        assert!(bridge.running.is_none());
+
+        let motivo = bridge
+            .murio_al_arrancar("ZY22")
+            .expect("lo juntó el recolector, pero el arranque falló igual");
+        assert!(motivo.contains("Encoder error"), "motivo: {motivo}");
+    }
+
+    /// Si entre el arranque y la comprobación alguien prendió la cámara de otro
+    /// teléfono, este arranque no es el que hay que declarar fallido: contestar
+    /// que sí falló apagaría un interruptor que está bien encendido.
+    #[tokio::test]
+    async fn la_camara_de_otro_telefono_no_es_este_fallo() {
+        let mut bridge = WebcamBridge::de_prueba("OTRO", "sleep 30");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert!(bridge.murio_al_arrancar("ZY22").is_none());
+    }
+
+    /// Un proceso que termina sin escribir nada igual es un arranque fallido, y
+    /// hay que contestar algo: un error vacío en la pantalla no se distingue de
+    /// no haber fallado.
+    #[tokio::test]
+    async fn morir_sin_decir_nada_igual_contesta_algo() {
+        let mut bridge = WebcamBridge::de_prueba("ZY22", "exit 3");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        let motivo = bridge.murio_al_arrancar("ZY22").expect("murió");
+        assert!(!motivo.trim().is_empty(), "motivo: {motivo:?}");
+    }
+
+    /// Un arranque nuevo no puede explicarse con el fallo del anterior.
+    #[tokio::test]
+    async fn el_motivo_no_se_hereda_del_arranque_anterior() {
+        let mut bridge = WebcamBridge::de_prueba("ZY22", "echo viejo >&2; exit 1");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(bridge.murio_al_arrancar("ZY22").is_some());
+
+        // `start` real necesita el dispositivo de bucle y scrcpy, que en CI no
+        // están; lo que se comprueba es que el motivo ya no esté guardado.
+        assert!(bridge.ultimo_fallo.is_none());
+    }
 
     /// Verbatim from `scrcpy 4.1 --list-camera-sizes` on a motorola edge 40,
     /// banner lines included, because those are exactly what a stricter parser
