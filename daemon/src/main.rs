@@ -24,7 +24,7 @@ mod windows;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::Mutex;
 use tokio::time::{interval, sleep};
@@ -50,12 +50,22 @@ const REAP_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Cuánto se le da a scrcpy para fracasar antes de dar el arranque por bueno.
 ///
-/// Los fallos habituales —la cámara tomada por otra aplicación del teléfono, un
-/// modo que el sensor no tiene, el teléfono bloqueado— se ven acá: scrcpy revisa
-/// los argumentos y el estado del teléfono antes de abrir la cámara. Alargar
-/// esto no alcanza a cubrir los que tardan más y sí retrasa cada arranque bueno,
-/// porque es tiempo que se espera siempre.
-const ESPERA_DE_ARRANQUE: Duration = Duration::from_millis(1500);
+/// Medido contra un motorola edge 40 por USB: un modo que el codificador del
+/// teléfono no puede configurar muere a los **2,5 s** —scrcpy tiene que empujar
+/// su servidor, abrir la cámara y recién ahí configurar el codificador—, y un
+/// túnel que no levanta tarda **7 s** en darse por vencido. Tres segundos cubren
+/// el primero, que es el que queda una vez arreglado el segundo.
+///
+/// No más, porque es tiempo que paga **cada** arranque que sí funciona: el
+/// fallo contesta apenas ocurre, pero el caso bueno espera hasta el final para
+/// poder decir que sí.
+const ESPERA_DE_ARRANQUE: Duration = Duration::from_secs(3);
+
+/// Cada cuánto se mira si scrcpy sigue vivo durante esa espera.
+///
+/// Se mira varias veces en lugar de dormir la espera entera de un saque: así un
+/// fallo contesta cuando ocurre y no cuando se acaba el plazo.
+const PASO_DE_ESPERA: Duration = Duration::from_millis(250);
 
 /// After udev reports a device, adb needs a moment before it lists it.
 const SETTLE: Duration = Duration::from_millis(600);
@@ -329,12 +339,20 @@ impl ConnectService {
         // pregunta con el candado suelto: sostenerlo deja al resto del servicio
         // esperando, y acá adentro está el recolector, que corre cada dos
         // segundos.
-        sleep(ESPERA_DE_ARRANQUE).await;
+        let limite = Instant::now() + ESPERA_DE_ARRANQUE;
+        loop {
+            sleep(PASO_DE_ESPERA).await;
 
-        let mut state = self.state.lock().await;
-        if let Some(motivo) = state.webcam.murio_al_arrancar(intento) {
-            return Err(FdoError::Failed(motivo));
+            let mut state = self.state.lock().await;
+            if let Some(motivo) = state.webcam.murio_al_arrancar(intento) {
+                return Err(FdoError::Failed(motivo));
+            }
+            if Instant::now() >= limite {
+                break;
+            }
         }
+
+        let state = self.state.lock().await;
 
         let announced = state.webcam.state();
         drop(state);
