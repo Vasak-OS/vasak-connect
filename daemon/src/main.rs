@@ -313,7 +313,7 @@ impl ConnectService {
 
         let mut state = self.state.lock().await;
 
-        let path = state
+        let (path, intento) = state
             .webcam
             .start(serial, camera_id, size, fps)
             .map_err(|err| FdoError::Failed(err.to_string()))?;
@@ -332,7 +332,7 @@ impl ConnectService {
         sleep(ESPERA_DE_ARRANQUE).await;
 
         let mut state = self.state.lock().await;
-        if let Some(motivo) = state.webcam.murio_al_arrancar(serial) {
+        if let Some(motivo) = state.webcam.murio_al_arrancar(intento) {
             return Err(FdoError::Failed(motivo));
         }
 
