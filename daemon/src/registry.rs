@@ -45,9 +45,21 @@ impl Registry {
     /// `~/.config/vasak/connect.json`, next to the rest of the session's
     /// configuration.
     pub fn path() -> Option<PathBuf> {
-        let base = std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+        // Through `dirs` rather than reading the environment here: any value
+        // was accepted, including the empty string and any relative path, which
+        // the spec says to ignore. This file is written, so a relative base put
+        // the registry under the process's working directory — which for a
+        // daemon is not anyone's home — and the paired devices would look like
+        // they had never been paired. `dirs` applies the rule as one rule and
+        // not two: an empty string is not an absolute path either. It only
+        // checks `HOME` for emptiness, so the filter closes that other half.
+        Self::path_under(dirs::config_dir())
+    }
+
+    /// The same decision without reading the environment, so it can be tested:
+    /// the environment is process-wide and tests run in parallel.
+    fn path_under(base: Option<PathBuf>) -> Option<PathBuf> {
+        let base = base.filter(|base| base.is_absolute())?;
         Some(base.join("vasak").join("connect.json"))
     }
 
@@ -79,7 +91,9 @@ impl Registry {
                 return;
             }
         }
-        let Ok(text) = serde_json::to_string_pretty(self) else { return };
+        let Ok(text) = serde_json::to_string_pretty(self) else {
+            return;
+        };
 
         // Written through a temporary file: a crash midway through would
         // otherwise leave a truncated file, and the next start would decide
@@ -110,10 +124,13 @@ impl Registry {
 
     /// Records a device, or refreshes what is known about one.
     pub fn remember(&mut self, serial: &str, model: &str, address: &str, now: &str) {
-        let entry = self.devices.entry(serial.to_string()).or_insert_with(|| KnownDevice {
-            first_seen: now.to_string(),
-            ..Default::default()
-        });
+        let entry = self
+            .devices
+            .entry(serial.to_string())
+            .or_insert_with(|| KnownDevice {
+                first_seen: now.to_string(),
+                ..Default::default()
+            });
         if !model.is_empty() {
             entry.model = model.to_string();
         }
@@ -146,7 +163,10 @@ mod tests {
         let mut registry = Registry::default();
         registry.remember("ZY22HB6KPB", "motorola edge 40", "", "2026-08-13T10:00:00Z");
         registry.remember("ZY22HB6KPB", "motorola edge 40", "", "2026-09-01T10:00:00Z");
-        assert_eq!(registry.get("ZY22HB6KPB").unwrap().first_seen, "2026-08-13T10:00:00Z");
+        assert_eq!(
+            registry.get("ZY22HB6KPB").unwrap().first_seen,
+            "2026-08-13T10:00:00Z"
+        );
     }
 
     #[test]
@@ -155,7 +175,12 @@ mod tests {
         // forget the name shown in the settings screen.
         let mut registry = Registry::default();
         registry.remember("ZY22HB6KPB", "motorola edge 40", "", "2026-08-13T10:00:00Z");
-        registry.remember("ZY22HB6KPB", "", "172.19.30.45:5555", "2026-08-13T11:00:00Z");
+        registry.remember(
+            "ZY22HB6KPB",
+            "",
+            "172.19.30.45:5555",
+            "2026-08-13T11:00:00Z",
+        );
         let device = registry.get("ZY22HB6KPB").unwrap();
         assert_eq!(device.model, "motorola edge 40");
         assert_eq!(device.last_address, "172.19.30.45:5555");
@@ -167,5 +192,31 @@ mod tests {
         registry.remember("A", "x", "", "now");
         assert!(registry.forget("A"));
         assert!(!registry.forget("A"));
+    }
+
+    #[test]
+    fn the_registry_hangs_off_the_config_directory() {
+        assert_eq!(
+            Registry::path_under(Some(PathBuf::from("/home/pato/.config"))),
+            Some(PathBuf::from("/home/pato/.config/vasak/connect.json"))
+        );
+    }
+
+    #[test]
+    fn a_relative_base_yields_no_path() {
+        // This file is written, so a relative base put the registry under the
+        // process's working directory — which for a daemon is not anyone's home
+        // — and the paired devices looked like they had never been paired.
+        //
+        // Empty, bare name, `./` and `../`: the bare name is the one that slips
+        // through when only the empty case is remembered.
+        for relative in ["", "config", "./config", "../config"] {
+            assert_eq!(
+                Registry::path_under(Some(PathBuf::from(relative))),
+                None,
+                "a base of {relative:?} must not yield a path"
+            );
+        }
+        assert_eq!(Registry::path_under(None), None);
     }
 }
