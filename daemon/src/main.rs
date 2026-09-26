@@ -116,11 +116,7 @@ impl ConnectService {
             .map(|(serial, known)| {
                 (
                     serial.clone(),
-                    if known.alias.is_empty() {
-                        known.model.clone()
-                    } else {
-                        known.alias.clone()
-                    },
+                    known.display_name().to_owned(),
                     known.first_seen.clone(),
                     known.last_address.clone(),
                 )
@@ -479,11 +475,7 @@ async fn refresh_devices(
             // the one the person recognises.
             if device.model.is_empty() {
                 if let Some(known) = state.registry.get(&device.serial) {
-                    device.model = if known.alias.is_empty() {
-                        known.model.clone()
-                    } else {
-                        known.alias.clone()
-                    };
+                    device.model = known.display_name().to_owned();
                 }
             }
 

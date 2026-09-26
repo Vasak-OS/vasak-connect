@@ -35,6 +35,24 @@ pub struct KnownDevice {
     pub favourites: Vec<String>,
 }
 
+impl KnownDevice {
+    /// The name the person recognises, which is the alias they chose if there
+    /// is one and the model otherwise.
+    ///
+    /// This is the rule the `alias` field's own comment describes, and it used
+    /// to be written out by hand at each of the two places that need it: the
+    /// settings screen and the model a device announces itself with when adb
+    /// reports none. Two copies of one fallback is two chances to fix it in one
+    /// of them, and the copy nobody was looking at is the one that ships.
+    pub fn display_name(&self) -> &str {
+        if self.alias.is_empty() {
+            &self.model
+        } else {
+            &self.alias
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Registry {
     #[serde(default)]
@@ -192,6 +210,33 @@ mod tests {
         registry.remember("A", "x", "", "now");
         assert!(registry.forget("A"));
         assert!(!registry.forget("A"));
+    }
+
+    #[test]
+    fn el_alias_manda_y_sin_alias_manda_el_modelo() {
+        // La regla que dice el comentario del campo, probada en el único lugar
+        // donde ahora está escrita. Antes vivía en dos handlers distintos.
+        let con_alias = KnownDevice {
+            model: "motorola edge 40".to_string(),
+            alias: "el teléfono del trabajo".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(con_alias.display_name(), "el teléfono del trabajo");
+
+        let sin_alias = KnownDevice {
+            model: "motorola edge 40".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(sin_alias.display_name(), "motorola edge 40");
+
+        // Un alias vacío es lo que deja `set_alias` con una cadena vacía, y
+        // tiene que caer al modelo igual que si nunca se hubiera puesto.
+        let alias_vacio = KnownDevice {
+            model: "motorola edge 40".to_string(),
+            alias: String::new(),
+            ..Default::default()
+        };
+        assert_eq!(alias_vacio.display_name(), "motorola edge 40");
     }
 
     #[test]
