@@ -118,7 +118,9 @@ fn parse_devices(out: &str) -> Vec<Device> {
 
         let mut fields = line.split_whitespace();
         let Some(id) = fields.next() else { continue };
-        let Some(status) = fields.next() else { continue };
+        let Some(status) = fields.next() else {
+            continue;
+        };
 
         let state = match status {
             "device" => DeviceState::Ready,
@@ -132,7 +134,11 @@ fn parse_devices(out: &str) -> Vec<Device> {
         // `adb connect` identifies network devices as host:port, and that is
         // also their "serial" as far as adb is concerned. The real serial only
         // arrives in the `-l` fields, and not always.
-        let over_tcp = id.contains(':') && id.rsplit(':').next().is_some_and(|p| p.parse::<u16>().is_ok());
+        let over_tcp = id.contains(':')
+            && id
+                .rsplit(':')
+                .next()
+                .is_some_and(|p| p.parse::<u16>().is_ok());
 
         let mut model = String::new();
         let mut serial = String::new();
@@ -147,12 +153,24 @@ fn parse_devices(out: &str) -> Vec<Device> {
         }
 
         devices.push(Device {
-            serial: if serial.is_empty() { id.to_string() } else { serial },
+            serial: if serial.is_empty() {
+                id.to_string()
+            } else {
+                serial
+            },
             model,
-            transport: if over_tcp { Transport::Tcp } else { Transport::Usb },
+            transport: if over_tcp {
+                Transport::Tcp
+            } else {
+                Transport::Usb
+            },
             state,
             trusted: false, // filled in by the registry, which owns that answer
-            address: if over_tcp { id.to_string() } else { String::new() },
+            address: if over_tcp {
+                id.to_string()
+            } else {
+                String::new()
+            },
         });
     }
 
@@ -287,8 +305,8 @@ mod tests {
         // de rango. Se genera aparte y a propósito, porque es justo el caso que
         // el generador anterior producía sin querer y con el que hay que
         // contar: tiene que salir como USB, con su serie y sin dirección.
-        let casi_tcp = ("[0-9]{1,3}(\\.[0-9]{1,3}){3}", 65536u32..99999)
-            .prop_map(|(h, p)| format!("{h}:{p}"));
+        let casi_tcp =
+            ("[0-9]{1,3}(\\.[0-9]{1,3}){3}", 65536u32..99999).prop_map(|(h, p)| format!("{h}:{p}"));
         let id = prop_oneof![usb, tcp, casi_tcp];
 
         let estado = prop_oneof![
@@ -415,13 +433,16 @@ mod tests {
 
     #[test]
     fn a_phone_waiting_for_the_prompt_is_not_an_error() {
-        let devices = parse_devices("List of devices attached\nZY22HB6KPB   unauthorized usb:1-2\n");
+        let devices =
+            parse_devices("List of devices attached\nZY22HB6KPB   unauthorized usb:1-2\n");
         assert_eq!(devices[0].state, DeviceState::Unauthorized);
     }
 
     #[test]
     fn network_devices_carry_their_address() {
-        let devices = parse_devices("List of devices attached\n172.19.30.45:5555 device model:motorola_edge_40\n");
+        let devices = parse_devices(
+            "List of devices attached\n172.19.30.45:5555 device model:motorola_edge_40\n",
+        );
         assert_eq!(devices[0].transport, Transport::Tcp);
         assert_eq!(devices[0].address, "172.19.30.45:5555");
     }
@@ -437,8 +458,14 @@ mod tests {
     fn reads_apps_on_one_line() {
         let apps = parse_apps(" * Ajustes                        com.android.settings\n - Telegram   org.telegram.messenger\n");
         assert_eq!(apps.len(), 2);
-        assert_eq!(apps[0], ("com.android.settings".into(), "Ajustes".into(), true));
-        assert_eq!(apps[1], ("org.telegram.messenger".into(), "Telegram".into(), false));
+        assert_eq!(
+            apps[0],
+            ("com.android.settings".into(), "Ajustes".into(), true)
+        );
+        assert_eq!(
+            apps[1],
+            ("org.telegram.messenger".into(), "Telegram".into(), false)
+        );
     }
 
     #[test]

@@ -98,6 +98,18 @@ fn nueva_pantalla(ancho: u32, alto: u32, densidad: u32) -> String {
     format!("--new-display={ancho}x{alto}/{densidad}")
 }
 
+/// El driver de vídeo que se le fija a SDL antes de lanzar scrcpy, o `None`
+/// para dejar que SDL elija.
+///
+/// Está en una función para poder afirmar la regla en un test sin abrir una
+/// ventana: se fuerza `wayland` **sólo** en una sesión Wayland (`hay_wayland`)
+/// y **sólo** si nadie fijó ya el driver (`ya_fijado`). Fuera de Wayland se
+/// devuelve `None` para no romper una sesión X, y si quien arranca el servicio
+/// eligió un driver se respeta esa elección.
+fn sdl_video_driver(hay_wayland: bool, ya_fijado: bool) -> Option<&'static str> {
+    (hay_wayland && !ya_fijado).then_some("wayland")
+}
+
 pub struct Window {
     pub label: String,
     pub pid: u32,
@@ -185,6 +197,23 @@ impl WindowManager {
             Transport::Usb => {
                 command.arg("--video-bit-rate=16M");
             }
+        }
+
+        // scrcpy abre su ventana con SDL2, y el orden de drivers de SDL2 en
+        // Linux prueba X11 **antes** que Wayland. El servicio corre como unidad
+        // de usuario de systemd: hereda `DISPLAY=:0` pero no un `XAUTHORITY`
+        // usable, así que en una sesión Wayland pura —la de VasakOS, sobre
+        // Wayfire— SDL elige XWayland, DRI3 no inicializa y scrcpy muere con
+        // «XIO: fatal IO error on X server :0» antes de mostrar nada: la app se
+        // listaba (eso no abre ventana) pero no arrancaba. Fijar el driver de
+        // Wayland cuando hay sesión Wayland lo manda directo al compositor. Sólo
+        // se pone si hay `WAYLAND_DISPLAY` y nadie lo fijó ya, para no tocar una
+        // sesión X ni pisar una elección explícita de quien arranca el servicio.
+        if let Some(driver) = sdl_video_driver(
+            std::env::var_os("WAYLAND_DISPLAY").is_some(),
+            std::env::var_os("SDL_VIDEODRIVER").is_some(),
+        ) {
+            command.env("SDL_VIDEODRIVER", driver);
         }
 
         let mut child = command.spawn().map_err(|err| {
@@ -379,5 +408,25 @@ mod tests {
     #[test]
     fn el_argumento_nombra_tamano_y_densidad() {
         assert_eq!(nueva_pantalla(1000, 700, 160), "--new-display=1000x700/160");
+    }
+
+    #[test]
+    fn en_wayland_se_fuerza_el_driver_wayland() {
+        // Es el caso que falla sin el arreglo: SDL2 prueba X11 primero y el
+        // servicio no tiene un :0 usable, así que sin fijarlo scrcpy muere.
+        assert_eq!(sdl_video_driver(true, false), Some("wayland"));
+    }
+
+    #[test]
+    fn fuera_de_wayland_no_se_toca_el_driver() {
+        // En una sesión X forzar wayland rompería al revés; se deja elegir a SDL.
+        assert_eq!(sdl_video_driver(false, false), None);
+    }
+
+    #[test]
+    fn una_eleccion_explicita_de_driver_se_respeta() {
+        // Si quien arranca el servicio ya puso SDL_VIDEODRIVER, manda esa.
+        assert_eq!(sdl_video_driver(true, true), None);
+        assert_eq!(sdl_video_driver(false, true), None);
     }
 }
