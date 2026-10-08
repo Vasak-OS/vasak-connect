@@ -90,7 +90,9 @@ pub fn watch() -> io::Result<mpsc::Receiver<HotplugEvent>> {
 
                 // One notification can cover several queued events.
                 for event in socket.iter() {
-                    let Some(parsed) = classify(&event) else { continue };
+                    let Some(parsed) = classify(&event) else {
+                        continue;
+                    };
                     if tx.blocking_send(parsed).is_err() {
                         debug!("nadie escucha los eventos de udev, se deja de observar");
                         return;
@@ -103,7 +105,9 @@ pub fn watch() -> io::Result<mpsc::Receiver<HotplugEvent>> {
     match ready_rx.recv() {
         Ok(Ok(())) => Ok(rx),
         Ok(Err(err)) => Err(err),
-        Err(_) => Err(io::Error::other("el hilo de udev terminó antes de arrancar")),
+        Err(_) => Err(io::Error::other(
+            "el hilo de udev terminó antes de arrancar",
+        )),
     }
 }
 
