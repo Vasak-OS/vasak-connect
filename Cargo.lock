@@ -1155,7 +1155,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vasak-connect-daemon"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "dirs",
  "libc",
@@ -1172,7 +1172,7 @@ dependencies = [
 
 [[package]]
 name = "vasak-connect-protocol"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "serde",
  "zbus",
