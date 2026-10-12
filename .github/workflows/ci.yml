@@ -24,3 +24,16 @@ jobs:
     # instala dependencias de terceros.
     secrets:
       SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+    with:
+      # Las pruebas de Rust corren en `revisar` y de esa misma corrida sale la
+      # cobertura que se le pasa a Sonar. Sin esto las pruebas no corrían en
+      # ningún PR, y un PR que sólo toca Rust pasaba la puerta sin medir nada
+      # (Vasak-OS/.github#25).
+      pruebas_rust: -p vasak-connect-protocol -p vasak-connect-daemon
+      # Lo que pide el grafo en Linux, mirado con `cargo tree -i`:
+      #
+      #   libudev-dev      `libudev-sys`
+      #   build-essential  el compilador de C de los `-sys`
+      paquetes_rust: >-
+        libudev-dev
+        build-essential
