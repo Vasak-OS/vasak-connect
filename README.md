@@ -1,233 +1,375 @@
-# vasak-connect
+# Vasak connect
 
-Usá las aplicaciones de tu celular Android como ventanas de VasakOS.
+Android Mobile integration
 
-No es un escritorio de Android dentro de una ventana: cada app se abre en su
-**propia ventana nativa**, junto a las del sistema, en su propio escritorio
-virtual del teléfono. La pantalla del celular sigue siendo tuya mientras tanto.
+---
 
-> **Estado: 0.1.0, sólo por USB.** Funciona de punta a punta y está probado
-> contra hardware real, pero le faltan cosas — mirá [Limitaciones](#limitaciones).
+## Tecnología
 
-## Cómo funciona
+[![Rust](https://img.shields.io/badge/Rust-1.82%2B-orange?style=flat&logo=rust)](https://www.rust-lang.org/) [![systemd](https://img.shields.io/badge/systemd-256%2B-24283b?style=flat&logo=systemd)](https://systemd.io/) [![D-Bus](https://img.shields.io/badge/D-Bus-1.15%2B-42b883?style=flat&logo=dbus)](https://dbus.freedesktop.org/) [![zbus](https://img.shields.io/badge/zbus-4.0-orange?style=flat&logo=rust)](https://github.com/dbus2/zbus)
 
-Un demonio escucha udev. Cuando enchufás un teléfono con la depuración USB
-activada, arranca el servidor de adb, lee qué aplicaciones tiene y lo publica en
-el bus de sesión. El panel, el centro de notificaciones y Ajustes leen de ahí.
+## Estado
 
-Abrir una app es un proceso de [scrcpy](https://github.com/Genymobile/scrcpy) con
-un display virtual propio. El demonio los supervisa y los cierra cuando
-corresponde.
+[![CI](https://github.com/Vasak-OS/vasak-connect/actions/workflows/ci.yml/badge.svg)](https://github.com/Vasak-OS/vasak-connect/actions/workflows/ci.yml)
+[![Versión](https://img.shields.io/github/v/release/Vasak-OS/vasak-connect?style=flat&label=Versi%C3%B3n)](https://github.com/Vasak-OS/vasak-connect/releases)
+[![Licencia](https://img.shields.io/github/license/Vasak-OS/vasak-connect?style=flat)](LICENSE)
+[![Cobertura](https://sonarcloud.io/api/project_badges/measure?project=Vasak-OS_vasak-connect&metric=coverage&style=flat)](https://sonarcloud.io/summary/new_code?id=Vasak-OS_vasak-connect)
+[![Quality Gate](https://sonarcloud.io/api/project_badges/measure?project=Vasak-OS_vasak-connect&metric=alert_status&style=flat)](https://sonarcloud.io/summary/new_code?id=Vasak-OS_vasak-connect)
+[![Tamaño repo](https://img.shields.io/github/repo-size/Vasak-OS/vasak-connect?style=flat)](https://github.com/Vasak-OS/vasak-connect)
 
+---
+
+## Descripción
+
+Android Mobile integration
+
+**Para el usuario:** Android Mobile integration
+
+**Integración VasakOS:** Integra con el ecosistema VasakOS vía D-Bus y configuración compartida.
+
+---
+
+## Arquitectura (diagramas)
+
+> Copia y pega la plantilla que necesites, descomenta y adapta.
+
+### Flujo de datos
+
+```mermaid
+<!--
+graph TD
+    A[Entrada: Teclado / Ratón / D-Bus / Sistema] --> B[Procesamiento: Core Rust + Tauri Commands]
+    B --> C[Salida: UI actualizada / Acciones del sistema]
+    style A fill:#e1f5fe
+    style C fill:#e8f5e9
+-->
 ```
-udev ──► vasak-connect ──► D-Bus (sesión) ──┬─► vasak-desktop   (menú, estado)
-             │                              └─► vasak-settings  (dispositivos)
-             └─► scrcpy (uno por app) ──────► una ventana Wayland cada uno
+
+### Componentes internos
+
+```mermaid
+<!--
+flowchart LR
+    subgraph App[Vasak connect]
+        UI[Frontend Vue 3 + vue-libvasak]
+        Core[Core Rust: lógica principal]
+        IPC[Tauri Commands / Eventos]
+        System[Systemd / D-Bus / PipeWire / Wayland]
+    end
+    UI --> IPC
+    IPC --> Core
+    Core --> DBus[(D-Bus / zbus)]
+    Core --> System
+    style UI fill:#f3e5f5
+    style Core fill:#e3f2fd
+    style DBus fill:#fff3e0
+    style System fill:#fce4ec
+-->
 ```
 
-### Por qué un demonio y no una aplicación Tauri
+### Integración en el sistema VasakOS
 
-Porque no dibuja nada. Las tres interfaces que necesita esta función —el menú
-del panel, el estado en el centro de notificaciones y la lista de dispositivos en
-Ajustes— viven en aplicaciones que ya existen, y ninguna puede dibujar dentro de
-la ventana de otra. No queda ninguna ventana que un proceso de acá tenga que
-crear, y cargar un WebKit residente para un servicio sin ventana es exactamente
-el gasto que VasakOS viene sacando de otros demonios.
+```mermaid
+<!--
+C4Context
+    title Vasak connect en VasakOS
+    Person(usuario, "Usuario", "Persona que usa el sistema")
+    System_Boundary(c1, "VasakOS") {
+        System(app, "Vasak connect", "Android Mobile integration")
+        System_Ext(settings, "vasak-settings", "Configuración central")
+        System_Ext(keyring, "vasak-keyring", "Secrets y claves")
+        System_Ext(accounts, "vasak-accounts", "Cuentas e identidad")
+        System_Ext(permissions, "vasak-permissions", "Permisos y portales")
+    }
+    System_Ext(systemd, "systemd", "Gestión de servicios")
+    System_Ext(dbus, "D-Bus", "Bus de mensajes del sistema")
+    System_Ext(wayland, "Wayland / Wayfire", "Compositor")
+    System_Ext(pipewire, "PipeWire", "Multimedia")
+    Rel(usuario, app, "Usa")
+    Rel(app, settings, "Lee/escribe config")
+    Rel(app, keyring, "Guarda/lee secrets")
+    Rel(app, accounts, "Identidad de cuenta")
+    Rel(app, permissions, "Solicita permisos")
+    Rel(app, systemd, "Activación / sockets")
+    Rel(app, dbus, "Expone / consume interfaces")
+    Rel(app, wayland, "Superficies / protocolos")
+    Rel(app, pipewire, "Streams de audio/video")
+-->
+```
 
-### Por qué el bus de sesión
+---
 
-El teléfono es de quien inició sesión, el servidor de adb es por usuario, las
-ventanas tienen que aparecer en *esa* sesión y la lista de dispositivos es
-configuración personal. Nada de eso necesita root ni polkit.
+## Instalación
 
-## Requisitos
-
-| | |
-|---|---|
-| `android-tools` | el `adb` que habla con el teléfono |
-| `scrcpy` ≥ 4.0 | los displays virtuales (`--new-display`) y que la ventana se pueda redimensionar (`--flex-display`, estrenada en 4.0) |
-| `v4l2loopback` | el dispositivo donde se escribe la cámara (webcam) |
-| Android | probado en 15; los displays virtuales necesitan una versión reciente |
-
-El módulo `v4l2loopback` lo provee el propio kernel en varias distribuciones
-—los kernels de CachyOS lo traen compilado— y en el resto sale de
-`v4l2loopback-dkms`. Por eso el paquete depende del proveedor virtual
-`V4L2LOOPBACK-MODULE` y no de un paquete concreto: nombrar el de DKMS obligaría
-a recompilar en cada actualización de kernel a quien ya lo tiene.
-
-En el teléfono hace falta **Opciones de desarrollador → Depuración por USB**, y
-aceptar el diálogo la primera vez que lo conectás.
-
-## Compilar y probar
+### Arch Linux (repo oficial)
 
 ```bash
-cargo build --release
-cargo test
+pacman -S vasak-vasak-connect
 ```
 
-Para probarlo sin instalar nada:
+### Debian / Ubuntu (.deb)
 
 ```bash
-RUST_LOG=vasak_connect=debug ./target/release/vasak-connect
+wget https://github.com/Vasak-OS/vasak-connect/releases/download/v{{VERSION}}/vasak-vasak-connect_{{VERSION}}_amd64.deb
+sudo apt install ./vasak-vasak-connect_{{VERSION}}_amd64.deb
 ```
 
-Y desde otra terminal:
+### Desde fuente
 
 ```bash
-busctl --user call ar.net.vasak.os.Connect /ar/net/vasak/os/Connect \
-  ar.net.vasak.os.Connect ListDevices
+git clone https://github.com/Vasak-OS/vasak-connect.git
+cd vasak-connect
 
-busctl --user call ar.net.vasak.os.Connect /ar/net/vasak/os/Connect \
-  ar.net.vasak.os.Connect ListApps sb "TU_SERIAL" false
+# Build completo
+cargo build --release --locked
 
-busctl --user call ar.net.vasak.os.Connect /ar/net/vasak/os/Connect \
-  ar.net.vasak.os.Connect LaunchApp ss "TU_SERIAL" "com.google.android.calculator"
+# Instalar binario
+cargo install --locked --path .
+
+# Paquetes nativos
+# Arch: makepkg -sf en PKGBUILDS/vasak-connect/
+# Debian: cargo deb --no-build --target-dir target/release/debian
 ```
 
-## La interfaz D-Bus
+### Flatpak / AppImage
 
-Nombre `ar.net.vasak.os.Connect`, ruta `/ar/net/vasak/os/Connect`, bus de sesión.
-El contrato está en [`protocol/`](protocol/src/lib.rs), que es la fuente de
-verdad: el panel y Ajustes dependen de esa crate para no quedar desfasados.
+> *Placeholder: añadir cuando exista paquete Flatpak o AppImage oficial.*
 
-### Métodos
+---
 
-| Método | Firma | Qué hace |
-|---|---|---|
-| `ListDevices` | `() → a(ssssbs)` | Los teléfonos visibles ahora |
-| `ListKnownDevices` | `() → a(ssss)` | Los que ya se conectaron alguna vez |
-| `ListApps` | `(s serial, b refresh) → a(ssbs)` | Aplicaciones instaladas |
-| `LaunchApp` | `(s serial, s package) → u` | Abre la app; devuelve el PID |
-| `StopApp` | `(s serial, s package) → b` | Cierra la ventana |
-| `ListRunning` | `() → a(sssu)` | Ventanas abiertas |
-| `SetAlias` | `(s serial, s alias) → b` | Renombra un dispositivo |
-| `ForgetDevice` | `(s serial) → b` | Lo saca de la lista de conocidos |
-| `ListCameras` | `(s serial, b refresh) → a(ssasau)` | Cámaras, con sus tamaños y fps |
-| `StartWebcam` | `(s serial, s camera_id, s size, u fps) → s` | Conecta la cámara; devuelve `/dev/videoN` |
-| `StopWebcam` | `() → b` | Corta el stream |
-| `WebcamState` | `() → (bssss)` | Qué está haciendo el puente |
-
-### Señales
-
-`DeviceAdded`, `DeviceRemoved`, `DeviceChanged`, `AppClosed`, `WebcamChanged`.
-
-`DeviceChanged` es la que importa para el estado: un teléfono aparece como
-`unauthorized` hasta que la persona acepta el diálogo, y pasa a `ready` sin que
-haya que volver a enchufarlo.
-
-`WebcamChanged` existe porque el stream puede terminar sin que nadie lo pida
-—el teléfono se bloquea, u otra app del teléfono se queda con el sensor—, y un
-panel que siga mostrando «transmitiendo» diez minutos después es peor que no
-mostrar nada.
-
-## La cámara como webcam
-
-La cámara del teléfono se puede usar en cualquier aplicación de videollamada.
-scrcpy lee el sensor y escribe los cuadros en un dispositivo `v4l2loopback`;
-Zoom, Firefox u OBS lo ven como una cámara más, llamada **VasakOS Phone**.
+## Uso rápido
 
 ```bash
-busctl --user call ar.net.vasak.os.Connect /ar/net/vasak/os/Connect \
-  ar.net.vasak.os.Connect ListCameras sb "TU_SERIAL" false
-
-busctl --user call ar.net.vasak.os.Connect /ar/net/vasak/os/Connect \
-  ar.net.vasak.os.Connect StartWebcam sssu "TU_SERIAL" "0" "1280x720" 30
+# Se lanza automáticamente (systemd --user) o manualmente:
+vasak-connect
 ```
 
-Tres decisiones que conviene conocer antes de cambiar algo acá:
+### Atajos / flags principales
 
-**El dispositivo se busca por nombre, no por número.** `/dev/video0` es la
-primera cámara que encontró el kernel, que en una notebook es la webcam
-integrada: escribir ahí sería escribir encima de hardware real. El módulo se
-carga con un `card_label` conocido y el demonio lo busca en sysfs, así que el
-número puede ser cualquiera. Ojo: V4L2 trunca la etiqueta a 31 caracteres, y la
-comparación es por igualdad — un nombre más largo no coincidiría con nada.
+| Acción | Comando / Tecla |
+|--------|-----------------|
+| Acción principal | `vasak-connect` |
+| Configuración | `vasak-connect --config` |
+| Ayuda | `vasak-connect --help` |
 
-**El módulo se carga al arrancar, no cuando hace falta.** `modprobe` necesita
-root y este servicio corre en la sesión; pedir una autorización de polkit para
-encender una webcam sería peor que el problema que resuelve. Que esté siempre
-cargado no molesta gracias a `exclusive_caps=1`: con esa opción el dispositivo
-sólo se anuncia como cámara mientras algo esté escribiendo en él. Sin ella,
-todas las aplicaciones de videollamada ofrecerían «VasakOS Phone»
-permanentemente y mostrarían negro a quien la eligiera.
+> **Captura:** `assets/demo.gif` *(placeholder — sustituir por GIF real)*
 
-**Un stream a la vez.** Un dispositivo V4L2 admite una sola fuente. Conectar un
-segundo teléfono no agregaría una cámara: corrompería la primera, así que el
-puente es único y lo dice con un error propio.
-
-Los tamaños y los fps salen del teléfono, no de una lista de resoluciones
-comunes: pedir un modo que el sensor no tiene es la forma habitual de que el
-stream abra y se muera medio segundo después.
+---
 
 ## Configuración
 
-`~/.config/vasak/connect.json` guarda los dispositivos conocidos: modelo, alias,
-cuándo se vieron por primera vez y su última dirección.
+### Archivo de configuración
 
-**No guarda credenciales ni autorizaciones.** La confianza real es la de adb —un
-par de claves RSA y el diálogo del teléfono— y es la única que decide si una
-conexión funciona. Duplicarla acá crearía dos respuestas a la misma pregunta, y
-la de este archivo sería la que no puede hacer cumplir nada. `ForgetDevice`
-olvida el nombre; para revocar el acceso de verdad, **Revocar autorizaciones de
-depuración USB** en las opciones de desarrollador del teléfono.
-
-## Costo cuando no hay nada conectado
-
-El demonio no sondea: se queda bloqueado en el socket netlink de udev. Sin
-teléfono, no hay despertares ni CPU, y el servidor de adb **ni siquiera se
-arranca** hasta que udev avisa que hay algo. Al arrancar consulta udev una vez,
-por si ya había un teléfono enchufado.
-
-Si no lo querés corriendo:
-
-```bash
-systemctl --user disable --now vasak-connect
+```
+~/.config/vasak/vasak-connect.toml
 ```
 
-## Limitaciones
+### Variables de entorno
 
-**Sin iconos.** Las apps se listan con su nombre. Android no expone los iconos
-por ninguna orden de shell: hay que bajarse el APK y sacarlos de sus recursos, o
-instalar una app compañera en el teléfono. El campo `icon` ya está en el
-contrato para que agregarlo después no lo rompa.
+| Variable | Descripción | Por defecto |
+|----------|-------------|-------------|
+| `VASAK_DEBUG` | Activa logs de depuración en consola | `false` |
+| `VASAK_PROFILE` | Perfil de rendimiento: `balanced`, `performance`, `power-save` | `balanced` |
 
-**Sólo USB.** La conexión inalámbrica está diseñada pero no implementada. Dos
-cosas que ya sabemos y condicionan cómo se va a hacer:
+### Integración con `tauri-plugin-config-manager`
 
-- El `android-tools` de Arch está compilado **sin mDNS** (`adb mdns check` lo
-  dice), así que el descubrimiento automático lo va a tener que hacer el demonio
-  navegando `_adb-tls-connect._tcp` por su cuenta.
-- mDNS es link-local: en una red segmentada —una oficina, una universidad— no
-  cruza. Por eso el registro guarda `last_address`: reconectar directo es el
-  único camino cuando no hay descubrimiento.
+- Esquemas de color: respeta `--ui-primary`, `--ui-surface`, `--ui-focus`, `--ui-on-surface`, `--ui-border`
+- Tema de iconos: usa el tema del sistema (`vasakos-icon-theme`) vía `vicon` lookup
+- Radio de bordes: variable CSS `--ui-radius` del esquema activo (por defecto 12px)
+- Fuentes: `--ui-font-family`, `--ui-font-size-base` desde el esquema
 
-**La webcam necesita un reinicio después de actualizar el kernel.** El módulo
-que se instaló es el del kernel nuevo, y el que corre es el viejo; hasta
-reiniciar, `WebcamState` devuelve el dispositivo vacío y `StartWebcam` explica
-por qué. Es el único caso en que la función aparece como no disponible en un
-sistema que la tiene instalada.
+---
 
-**La cámara no trae audio.** El puente pasa vídeo solamente. El micrófono del
-teléfono es un stream aparte y mezclarlo acá significaría decidir por la
-aplicación de videollamada, que ya tiene su propio selector de micrófono.
+## Desarrollo
 
-**El menú lista todo.** 128 aplicaciones en el teléfono de prueba, 39 de ellas
-del sistema. El campo `system` está para que el panel las esconda por defecto,
-pero falta decidir favoritos y buscador.
+### Requisitos
 
-**Los elementos de la app se ven chicos.** La ventana se puede agrandar y la app
-se re-acomoda —eso funciona—, pero scrcpy deja la densidad de la pantalla fija al
-redimensionar, así que hay que elegir una sola: a 160 dpi un dp es un píxel y la
-app usa el diseño que le corresponde al tamaño real de la ventana; a una densidad
-más alta los elementos se ven más grandes y la app cree estar en un teléfono por
-más que la ventana ocupe media pantalla. Se eligió lo primero. Tener las dos cosas
-necesita densidad dinámica en scrcpy, que hoy es una propuesta abierta
-([Genymobile/scrcpy#6784](https://github.com/Genymobile/scrcpy/issues/6784)).
+- **Rust:** `rustup` toolchain estable (`rust-toolchain.toml` fija la versión)
+- **Node / bun:** `bun` ≥ 1.1 (nunca npm/yarn/pnpm para apps Tauri)
+- **Sistema:** `pkg-config`, `libgtk-3-dev`, `libwebkit2gtk-4.1-dev`, `libssl-dev`
+- *`libdbus-1-dev`, `libsystemd-dev` para systemd*
 
-**Las ventanas comparten `app_id`.** Cada app es un proceso de scrcpy, y el panel
-probablemente las agrupe todas bajo el mismo icono. Falta ver si se puede fijar
-por instancia.
+### Dependencias de desarrollo
+
+#### Sistema (paquetes Arch / Debian / Fedora)
+
+`base-devel`, `pkgconf`, `libssl-dev`, `libwebkit2gtk-4.1-dev`, `libgtk-3-dev`, `libayatana-appindicator3-dev`, `librsvg2-dev`, `gstreamer1.0-plugins-base`, `gstreamer1.0-plugins-good`, `libpipewire-0.3-dev`, `libwireplumber-0.5-dev`, `libdbus-1-dev`, `libudev-dev`, `libxkbcommon-dev`, `libwayland-dev`, `meson`, `ninja`, `clang`, `lld`
+
+#### Rust
+
+`rustup` → `stable` + `rustfmt` + `clippy`
+
+#### Node
+
+**Solo `bun`** (nunca npm/yarn/pnpm para apps Tauri). `bun --version` ≥ 1.1
+
+#### Herramientas CLI
+
+`just` (command runner), `cargo-binstall` (opcional), `cargo-llvm-cov` (para cobertura)
+
+### Correr la app en desarrollo
+
+```bash
+# Frontend (Vite dev server + Tauri dev)
+bun run tauri dev
+
+# Solo frontend (Vite)
+bun run dev
+
+# Solo backend (cargo watch)
+cargo watch -x "run --bin vasak-connect"
+```
+
+### Compilar / Build de release
+
+```bash
+# Build completo (frontend + backend + bundle)
+bun run tauri build
+
+# Solo frontend (para testear bundle después)
+bun run build
+
+# Solo backend Rust (binario optimizado)
+cargo build --release --locked
+
+# Paquetes nativos
+# Arch: makepkg -sf en PKGBUILDS/vasak-connect/
+# Debian: cargo deb --no-build --target-dir src-tauri/target/release/debian
+```
+
+### Targets principales
+
+```bash
+# Desarrollo (Tauri dev server + hot reload)
+bun run dev
+
+# Build producción
+bun run build
+
+# Solo frontend
+bun run build:frontend
+
+# Solo backend Rust
+cargo build --release --locked
+
+# Lint + tipos (pre-commit / CI)
+bunx --bun biome check .
+bunx vue-tsc --noEmit
+cargo fmt --check
+```
+
+### Pruebas
+
+```bash
+# Suite completa Rust
+cargo test -p vasak-connect -p vasak-connect-lib --locked
+
+# Tests de integración (requieren D-Bus)
+cargo test -p vasak-connect-integration --locked -- --ignored
+```
+
+### Convención de commits
+
+[Conventional Commits](https://www.conventionalcommits.org/es/v1.0.0/):
+
+```
+<tipo>(<ámbito>): <descripción corta>
+
+[cuerpo opcional]
+
+[pie opcional: Closes #N]
+```
+
+Tipos habituales: `feat`, `fix`, `bugfix`, `docs`, `ci`, `chore`, `security`, `refactor`, `perf`, `test`.
+
+### Cómo abrir PR
+
+1. Rama desde `origin/main`:
+   ```bash
+   git worktree add -b feat/tema ~/wt/vasak-connect-tema origin/main
+   ```
+2. Prefijos de rama: `fix/`, `feat/`, `bugfix/`, `docs/`, `ci/`, `chore/`, `security/`
+3. Escribe el fix → **`qa` escribe las pruebas** (fallan sin el fix) → suite verde → abre PR
+4. Al abrir PR, **cuatro cosas obligatorias**:
+   - Asignado a `JoaquinDecima`
+   - Etiqueta `enhancement` o `bug` (+ `ci` / `dependencies` si aplica)
+   - Añadido al proyecto «VasakOS Roadmap»
+   - Status **In Progress**
+
+---
+
+## Arquitectura (texto)
+
+### Crates / módulos principales
+
+| `vasak-connect` | Binario principal / daemon systemd |
+| `vasak-connect-lib` | Lógica compartida / biblioteca pública |
+
+### Interfaces D-Bus / zbus expuestas
+
+| `org.vasak.Vasak-connect` | `GetStatus()`, `StatusChanged(dict)`, `Reload()`, `GetConfig()` | Control y estado del servicio |
+| `org.vasak.Vasak-connect.Admin` | `SetPolicy(dict)`, `AuditLog()` | API administrativa (solo root) |
+
+### Puntos de extensión
+
+- **Plugins:** Sistema de plugins modular
+- **Hooks:** Hooks de ciclo de vida
+- **API pública Rust:** API pública del crate principal
+
+### Features / Cargo features
+
+| Feature | Descripción | Default |
+|---------|-------------|---------|
+| `systemd` | Integración systemd (socket activation) | ✓ |
+| `tracing` | Logging estructurado con tracing | ✓ |
+| `admin` | API administrativa (solo root) | |
+| `pam` | Módulo PAM para autenticación | |
+
+Y para apps Tauri+Vue: features del `tauri.conf.json` → `bundle` / `plugins` / `allowlist` (capabilities).
+
+---
+
+## Pruebas y calidad
+
+- **Cobertura objetivo:** ≥ 80 % del código nuevo (SonarCloud Quality Gate)
+- **Informes:** GitHub Actions → pestaña *SonarCloud Code Analysis* → enlace a SonarCloud
+- **Añadir pruebas:** ver `AGENTS.md` sección 9 (mapa de repos y comandos de prueba)
+- **Regla:** toda corrección lleva prueba escrita por `qa` que falla sin el fix
+
+---
+
+## Contribuir
+
+- **Guía:** [.github/CONTRIBUTING.md](https://github.com/Vasak-OS/.github/blob/main/CONTRIBUTING.md)
+- **Plantillas de issue:** [.github/ISSUE_TEMPLATE/](https://github.com/Vasak-OS/.github/tree/main/ISSUE_TEMPLATE)
+- **Código de conducta:** [CODE_OF_CONDUCT.md](https://github.com/Vasak-OS/.github/blob/main/CODE_OF_CONDUCT.md)
+
+---
+
+## Contribuidores
+
+> **Actualizado automáticamente en CI** — muestra los avatares de quienes han aportado código a este repo.
+
+<div align="center">
+  
+</div>
+
+[Ver todos los contribuidores](https://github.com/Vasak-OS/vasak-connect/graphs/contributors)
+
+---
+
+## Donadores / Sponsors
+
+[![Sponsors](https://img.shields.io/github/sponsors/Vasak-OS?style=flat&label=Sponsors)](https://github.com/sponsors/Vasak-OS)
+
+> **Backers:** *Actualizado automáticamente en CI desde GitHub Sponsors / OpenCollective / Polar.*
+
+[💖 Donar al proyecto](https://github.com/sponsors/Vasak-OS)
+
+---
 
 ## Licencia
 
-[GPL-3.0-or-later](LICENSE)
+`GPL-3.0` — Copyright © 2026 **Vasak-OS Contributors**
+
+[Ver licencia completa](LICENSE)
