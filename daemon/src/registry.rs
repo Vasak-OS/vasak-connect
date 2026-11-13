@@ -33,6 +33,12 @@ pub struct KnownDevice {
     /// Packages the person pinned to the menu.
     #[serde(default)]
     pub favourites: Vec<String>,
+    /// La huella del certificado TLS fijada al parear este aparato por el canal
+    /// de red (módulo `channel`). Vacía en las entradas de adb, que parean por
+    /// otro mecanismo: es lo único que decide si un par de red es de confianza, y
+    /// se guarda sólo la huella pública, nunca un secreto del par.
+    #[serde(default)]
+    pub fingerprint: String,
 }
 
 impl KnownDevice {
@@ -57,6 +63,13 @@ impl KnownDevice {
 pub struct Registry {
     #[serde(default)]
     devices: BTreeMap<String, KnownDevice>,
+    /// Los pares de red pareados por el canal, por `device_id` (derivado del
+    /// certificado), separados de `devices` —que es de adb y va por serial— para
+    /// que las dos identidades no se mezclen: un teléfono por USB y el mismo por
+    /// la red tienen identificadores distintos, y la pantalla de ajustes de adb
+    /// no debe listar los pares de red ni al revés.
+    #[serde(default)]
+    peers: BTreeMap<String, KnownDevice>,
 }
 
 impl Registry {
@@ -169,6 +182,48 @@ impl Registry {
             }
             None => false,
         }
+    }
+
+    // ── Pares de red (canal) ─────────────────────────────────────────────────
+    //
+    // Keyed by `device_id`, no por serial: estos aparatos nunca anuncian un
+    // serial de adb, y su confianza la decide la huella del certificado, no el
+    // mecanismo de adb.
+
+    /// Fija (o refresca) un par como pareado, guardando la huella de su
+    /// certificado. Un par con huella es un par de confianza; olvidarlo la borra.
+    pub fn pin_peer(&mut self, device_id: &str, name: &str, fingerprint: &str, now: &str) {
+        let entry = self
+            .peers
+            .entry(device_id.to_string())
+            .or_insert_with(|| KnownDevice {
+                first_seen: now.to_string(),
+                ..Default::default()
+            });
+        if !name.is_empty() {
+            entry.model = name.to_string();
+        }
+        entry.fingerprint = fingerprint.to_string();
+    }
+
+    /// La huella fijada de un par, si está pareado.
+    pub fn peer_fingerprint(&self, device_id: &str) -> Option<&str> {
+        self.peers
+            .get(device_id)
+            .map(|peer| peer.fingerprint.as_str())
+            .filter(|fingerprint| !fingerprint.is_empty())
+    }
+
+    /// Olvida un par pareado. Devuelve si había algo que olvidar.
+    pub fn unpin_peer(&mut self, device_id: &str) -> bool {
+        self.peers.remove(device_id).is_some()
+    }
+
+    /// Todos los pares de red pareados, para la pantalla de ajustes.
+    pub fn paired_peers(&self) -> impl Iterator<Item = (&String, &KnownDevice)> {
+        self.peers
+            .iter()
+            .filter(|(_, peer)| !peer.fingerprint.is_empty())
     }
 }
 
