@@ -111,7 +111,11 @@ pub struct FileOffer {
     /// Identifica la transferencia para casar el ofrecimiento, la aceptación y
     /// el resultado.
     pub id: String,
-    /// Nombre propuesto, ya sin ninguna barra: el que recibe decide la carpeta.
+    /// Nombre propuesto. El que envía NO garantiza que no tenga barras ni `..`:
+    /// el que recibe decide la carpeta y **debe sanitizar el nombre** antes de
+    /// unirlo a una ruta, o un par malicioso escribe fuera de ella (path
+    /// traversal). El contrato sólo transporta el nombre; validarlo es del
+    /// receptor (daemon, PR del canal).
     pub name: String,
     pub size: u64,
     /// Tipo MIME declarado, o vacío si el que envía no lo sabe.
