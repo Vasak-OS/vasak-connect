@@ -4,7 +4,16 @@
 //! cannot drift apart: a field renamed on one end stops compiling on the other
 //! instead of silently becoming a device that never matches.
 
+/// El contrato de red teléfono↔escritorio. Vive aparte del contrato de D-Bus
+/// porque viaja por la red, y sólo usa `serde`/`serde_json`. El resto del crate
+/// (los tipos de D-Bus) está detrás de la feature `dbus`, activa por omisión; la
+/// app móvil depende con `default-features = false` y se lleva sólo `wire`, sin
+/// `zbus` —que no compila en Android/iOS—.
+pub mod wire;
+
+#[cfg(feature = "dbus")]
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "dbus")]
 use zbus::zvariant::Type;
 
 // ── Bus addresses ───────────────────────────────────────────────────────────
@@ -28,6 +37,7 @@ pub const SERVICE_INTERFACE: &str = "ar.net.vasak.os.Connect";
 /// The same phone can be plugged in *and* reachable over the network, with the
 /// same serial but two different adb identifiers. Everything is keyed by serial
 /// so it appears once in the menu, and this says which route is in use.
+#[cfg(feature = "dbus")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[zvariant(signature = "s")]
 #[serde(rename_all = "lowercase")]
@@ -36,6 +46,7 @@ pub enum Transport {
     Tcp,
 }
 
+#[cfg(feature = "dbus")]
 impl Transport {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -51,6 +62,7 @@ impl Transport {
 /// up, but nobody has tapped "Allow USB debugging" on the phone. It is not an
 /// error and it is not a working device — showing it as either one is how a
 /// user ends up staring at a menu that never fills.
+#[cfg(feature = "dbus")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[zvariant(signature = "s")]
 #[serde(rename_all = "lowercase")]
@@ -65,6 +77,7 @@ pub enum DeviceState {
     Offline,
 }
 
+#[cfg(feature = "dbus")]
 impl DeviceState {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -76,6 +89,7 @@ impl DeviceState {
     }
 }
 
+#[cfg(feature = "dbus")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 pub struct Device {
     /// Stable identity of the phone. Survives replugging, changing transport
@@ -94,6 +108,7 @@ pub struct Device {
 
 // ── Applications ────────────────────────────────────────────────────────────
 
+#[cfg(feature = "dbus")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 pub struct App {
     /// Android package name, e.g. `org.telegram.messenger`.
@@ -112,6 +127,7 @@ pub struct App {
 }
 
 /// An app currently open in its own window on this desktop.
+#[cfg(feature = "dbus")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 pub struct RunningApp {
     pub serial: String,
@@ -144,6 +160,7 @@ pub const WEBCAM_CARD_LABEL: &str = "VasakOS Phone";
 ///
 /// This is the only thing that tells a person which camera they are choosing:
 /// an id of `0` or `2` means nothing to anybody.
+#[cfg(feature = "dbus")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[zvariant(signature = "s")]
 #[serde(rename_all = "lowercase")]
@@ -154,6 +171,7 @@ pub enum CameraFacing {
     External,
 }
 
+#[cfg(feature = "dbus")]
 impl CameraFacing {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -175,6 +193,7 @@ impl CameraFacing {
     }
 }
 
+#[cfg(feature = "dbus")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 pub struct Camera {
     /// scrcpy's camera id. Opaque, and only unique within one device.
@@ -191,6 +210,7 @@ pub struct Camera {
 }
 
 /// What the webcam bridge is doing.
+#[cfg(feature = "dbus")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 pub struct WebcamState {
     /// Whether a phone camera is being written to the loopback device now.
