@@ -254,3 +254,76 @@ where
         .map_err(SessionError::Io)?;
     writer.flush().await.map_err(SessionError::Io)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::channel::pure::MAX_FRAME;
+
+    #[tokio::test]
+    async fn un_marco_escrito_se_lee_igual() {
+        let (mut a, mut b) = tokio::io::duplex(4096);
+        let sent = Message::Clipboard {
+            text: "hola".into(),
+        };
+        write_frame(&mut a, &sent).await.unwrap();
+        write_frame(&mut a, &Message::Ping).await.unwrap();
+        assert_eq!(read_frame(&mut b).await.unwrap(), sent);
+        assert_eq!(read_frame(&mut b).await.unwrap(), Message::Ping);
+    }
+
+    #[tokio::test]
+    async fn un_marco_sobre_el_tope_se_rechaza_sin_leer_el_cuerpo() {
+        let (mut a, mut b) = tokio::io::duplex(64);
+        let len = (MAX_FRAME as u32 + 1).to_be_bytes();
+        a.write_all(&len).await.unwrap();
+        assert!(matches!(
+            read_frame(&mut b).await,
+            Err(SessionError::Frame(FrameError::TooLarge(_)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn un_marco_de_largo_cero_se_rechaza() {
+        let (mut a, mut b) = tokio::io::duplex(64);
+        a.write_all(&[0, 0, 0, 0]).await.unwrap();
+        assert!(matches!(
+            read_frame(&mut b).await,
+            Err(SessionError::Frame(FrameError::Empty))
+        ));
+    }
+
+    #[tokio::test]
+    async fn cerrar_entre_marcos_es_cierre_limpio() {
+        let (a, mut b) = tokio::io::duplex(64);
+        drop(a);
+        assert!(matches!(
+            read_frame(&mut b).await,
+            Err(SessionError::Closed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn un_cuerpo_truncado_o_corrupto_es_error() {
+        // Cuerpo truncado: anuncia 10 bytes y entrega 3 antes de cerrar.
+        let (mut a, mut b) = tokio::io::duplex(64);
+        a.write_all(&[0, 0, 0, 10, b'{', b'}', b'x']).await.unwrap();
+        drop(a);
+        assert!(matches!(read_frame(&mut b).await, Err(SessionError::Io(_))));
+        // Cuerpo completo pero que no es un mensaje.
+        let (mut a, mut b) = tokio::io::duplex(64);
+        a.write_all(&[0, 0, 0, 3, b'x', b'y', b'z']).await.unwrap();
+        assert!(matches!(
+            read_frame(&mut b).await,
+            Err(SessionError::Frame(FrameError::Malformed))
+        ));
+    }
+
+    #[test]
+    fn los_errores_de_sesion_se_explican() {
+        assert!(!SessionError::Closed.to_string().is_empty());
+        assert!(!SessionError::Frame(FrameError::Empty)
+            .to_string()
+            .is_empty());
+    }
+}

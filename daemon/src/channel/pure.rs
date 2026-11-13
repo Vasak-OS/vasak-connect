@@ -292,3 +292,218 @@ pub fn self_name(etc_hostname: Option<&str>) -> String {
         .unwrap_or("VasakOS")
         .to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn peer(fingerprint: &str) -> PeerInfo {
+        PeerInfo {
+            device_id: "abc123".into(),
+            name: "Pixel 8".into(),
+            kind: DeviceKind::Phone,
+            protocol_version: PROTOCOL_VERSION,
+            fingerprint: fingerprint.into(),
+        }
+    }
+
+    #[test]
+    fn la_huella_sigue_el_formato_de_openssl() {
+        // SHA-256 de la entrada vacía, conocido.
+        assert_eq!(
+            fingerprint_from_der(b""),
+            "E3:B0:C4:42:98:FC:1C:14:9A:FB:F4:C8:99:6F:B9:24:27:AE:41:E4:64:9B:93:4C:A4:95:99:1B:78:52:B8:55"
+        );
+        let fp = fingerprint_from_der(b"cert");
+        assert_eq!(fp.len(), 32 * 3 - 1);
+        assert_eq!(fp, fp.to_ascii_uppercase());
+    }
+
+    #[test]
+    fn el_id_del_aparato_sale_de_la_huella_sin_dos_puntos_y_en_minusculas() {
+        assert_eq!(device_id_from_fingerprint("AB:CD:0F"), "abcd0f");
+        let fp = fingerprint_from_der(b"cert");
+        let id = device_id_from_fingerprint(&fp);
+        assert_eq!(id.len(), 64);
+        assert!(!id.contains(':'));
+    }
+
+    #[test]
+    fn las_huellas_se_comparan_sin_importar_caso_ni_bordes() {
+        assert!(fingerprints_equal("AB:CD", " ab:cd "));
+        assert!(!fingerprints_equal("AB:CD", "AB:CE"));
+    }
+
+    #[test]
+    fn el_largo_del_marco_es_big_endian() {
+        assert_eq!(frame_len([0, 0, 1, 0]), 256);
+        assert_eq!(frame_len([0, 0, 0, 0]), 0);
+    }
+
+    #[test]
+    fn un_marco_vacio_se_rechaza() {
+        assert_eq!(check_frame_len(0), Err(FrameError::Empty));
+    }
+
+    #[test]
+    fn un_marco_sobre_el_tope_se_rechaza_sin_reservar_memoria() {
+        assert_eq!(MAX_FRAME, 1024 * 1024);
+        assert_eq!(check_frame_len(MAX_FRAME), Ok(MAX_FRAME));
+        assert_eq!(
+            check_frame_len(MAX_FRAME + 1),
+            Err(FrameError::TooLarge(MAX_FRAME + 1))
+        );
+        // Un largo de 4 GiB anunciado en la cabecera.
+        assert_eq!(
+            check_frame_len(frame_len([0xFF; 4])),
+            Err(FrameError::TooLarge(u32::MAX as usize))
+        );
+    }
+
+    #[test]
+    fn un_mensaje_codificado_se_decodifica_igual() {
+        let messages = [
+            Message::Ping,
+            Message::Hello(peer("AA:BB")),
+            Message::Clipboard {
+                text: "hola ñandú".into(),
+            },
+        ];
+        for message in messages {
+            let framed = encode_frame(&message);
+            let header: [u8; 4] = framed[..4].try_into().unwrap();
+            assert_eq!(frame_len(header), framed.len() - 4);
+            assert_eq!(decode_frame(&framed[4..]), Ok(message));
+        }
+    }
+
+    #[test]
+    fn un_cuerpo_corrupto_o_truncado_es_error_y_no_panico() {
+        assert_eq!(decode_frame(b"no es json"), Err(FrameError::Malformed));
+        assert_eq!(decode_frame(b"{\"type\":"), Err(FrameError::Malformed));
+        let framed = encode_frame(&Message::Hello(peer("AA")));
+        let body = &framed[4..];
+        assert_eq!(
+            decode_frame(&body[..body.len() / 2]),
+            Err(FrameError::Malformed)
+        );
+    }
+
+    #[test]
+    fn los_errores_de_marco_se_explican_en_texto() {
+        assert!(FrameError::TooLarge(5).to_string().contains('5'));
+        assert!(!FrameError::Empty.to_string().is_empty());
+        assert!(!FrameError::Malformed.to_string().is_empty());
+    }
+
+    #[test]
+    fn un_par_pareado_con_la_misma_huella_es_de_confianza() {
+        assert_eq!(
+            evaluate_peer_cert("AA:BB", Some("aa:bb")),
+            TrustDecision::Trusted
+        );
+    }
+
+    #[test]
+    fn un_par_pareado_con_otra_huella_se_rechaza() {
+        assert_eq!(
+            evaluate_peer_cert("AA:BB", Some("CC:DD")),
+            TrustDecision::Reject
+        );
+    }
+
+    #[test]
+    fn un_par_sin_fijar_queda_sin_parear() {
+        assert_eq!(evaluate_peer_cert("AA:BB", None), TrustDecision::Unpaired);
+    }
+
+    #[test]
+    fn solo_la_version_del_protocolo_propia_es_compatible() {
+        assert!(protocol_compatible(PROTOCOL_VERSION));
+        assert!(!protocol_compatible(PROTOCOL_VERSION + 1));
+    }
+
+    #[test]
+    fn un_hello_valido_pasa() {
+        assert_eq!(verify_hello(&peer("AA:BB"), "aa:bb"), Ok(()));
+    }
+
+    #[test]
+    fn un_hello_de_version_incompatible_se_rechaza() {
+        let mut p = peer("AA:BB");
+        p.protocol_version = PROTOCOL_VERSION + 1;
+        assert_eq!(
+            verify_hello(&p, "AA:BB"),
+            Err(HelloError::IncompatibleVersion(PROTOCOL_VERSION + 1))
+        );
+    }
+
+    #[test]
+    fn un_hello_con_huella_que_no_es_la_del_tls_se_rechaza() {
+        assert_eq!(
+            verify_hello(&peer("AA:BB"), "CC:DD"),
+            Err(HelloError::FingerprintMismatch)
+        );
+        assert!(!HelloError::FingerprintMismatch.to_string().is_empty());
+        assert!(HelloError::IncompatibleVersion(9).to_string().contains('9'));
+    }
+
+    #[test]
+    fn el_codigo_de_verificacion_es_el_del_contrato() {
+        assert_eq!(
+            verification_code("AA", "BB"),
+            wire::verification_code("AA", "BB")
+        );
+    }
+
+    fn txt_map(peer: &PeerInfo) -> HashMap<String, String> {
+        build_txt(peer).into_iter().collect()
+    }
+
+    #[test]
+    fn el_registro_txt_va_y_vuelve() {
+        let original = peer("AA:BB");
+        assert_eq!(parse_peer_txt(&txt_map(&original)), Some(original));
+    }
+
+    #[test]
+    fn un_anuncio_al_que_le_faltan_claves_se_ignora() {
+        for key in [
+            wire::txt::DEVICE_ID,
+            wire::txt::NAME,
+            wire::txt::FINGERPRINT,
+            wire::txt::PROTOCOL,
+        ] {
+            let mut map = txt_map(&peer("AA:BB"));
+            map.remove(key);
+            assert_eq!(parse_peer_txt(&map), None, "sin {key}");
+            // Presente pero vacía es lo mismo que ausente.
+            map.insert(key.to_string(), String::new());
+            assert_eq!(parse_peer_txt(&map), None, "{key} vacía");
+        }
+    }
+
+    #[test]
+    fn un_anuncio_con_version_no_numerica_se_ignora() {
+        let mut map = txt_map(&peer("AA:BB"));
+        map.insert(wire::txt::PROTOCOL.to_string(), "uno".into());
+        assert_eq!(parse_peer_txt(&map), None);
+    }
+
+    #[test]
+    fn un_tipo_desconocido_o_ausente_no_descarta_el_anuncio() {
+        let mut map = txt_map(&peer("AA:BB"));
+        map.insert(wire::txt::KIND.to_string(), "fridge".into());
+        assert_eq!(parse_peer_txt(&map).unwrap().kind, DeviceKind::Unknown);
+        map.remove(wire::txt::KIND);
+        assert_eq!(parse_peer_txt(&map).unwrap().kind, DeviceKind::Unknown);
+    }
+
+    #[test]
+    fn el_nombre_del_equipo_cae_a_uno_generico_si_no_hay() {
+        assert_eq!(self_name(Some("lince\n")), "lince");
+        assert_eq!(self_name(Some("  \n")), "VasakOS");
+        assert_eq!(self_name(Some("")), "VasakOS");
+        assert_eq!(self_name(None), "VasakOS");
+    }
+}

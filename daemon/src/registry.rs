@@ -319,4 +319,59 @@ mod tests {
         }
         assert_eq!(Registry::path_under(None), None);
     }
+
+    #[test]
+    fn un_par_fijado_se_lee_y_se_lista() {
+        let mut registry = Registry::default();
+        registry.pin_peer("dev1", "Pixel 8", "AA:BB", "t1");
+        assert_eq!(registry.peer_fingerprint("dev1"), Some("AA:BB"));
+        assert_eq!(registry.peer_fingerprint("otro"), None);
+        let listed: Vec<_> = registry.paired_peers().collect();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].0, "dev1");
+        assert_eq!(listed[0].1.model, "Pixel 8");
+        assert_eq!(listed[0].1.first_seen, "t1");
+    }
+
+    #[test]
+    fn volver_a_fijar_refresca_la_huella_y_conserva_la_primera_vez() {
+        let mut registry = Registry::default();
+        registry.pin_peer("dev1", "Pixel 8", "AA:BB", "t1");
+        registry.pin_peer("dev1", "", "CC:DD", "t2");
+        assert_eq!(registry.peer_fingerprint("dev1"), Some("CC:DD"));
+        let (_, peer) = registry.paired_peers().next().unwrap();
+        assert_eq!(peer.model, "Pixel 8");
+        assert_eq!(peer.first_seen, "t1");
+    }
+
+    #[test]
+    fn olvidar_un_par_borra_su_huella() {
+        let mut registry = Registry::default();
+        registry.pin_peer("dev1", "Pixel 8", "AA:BB", "t1");
+        assert!(registry.unpin_peer("dev1"));
+        assert!(!registry.unpin_peer("dev1"));
+        assert_eq!(registry.peer_fingerprint("dev1"), None);
+        assert_eq!(registry.paired_peers().count(), 0);
+    }
+
+    #[test]
+    fn una_huella_vacia_no_cuenta_como_pareado() {
+        let mut registry = Registry::default();
+        registry.pin_peer("dev1", "Pixel 8", "", "t1");
+        assert_eq!(registry.peer_fingerprint("dev1"), None);
+        assert_eq!(registry.paired_peers().count(), 0);
+    }
+
+    #[test]
+    fn los_pares_de_red_no_se_mezclan_con_los_de_adb() {
+        let mut registry = Registry::default();
+        registry.remember("SERIAL1", "motorola edge 40", "", "t1");
+        registry.pin_peer("dev1", "Pixel 8", "AA:BB", "t2");
+        assert!(!registry.is_known("dev1"));
+        assert_eq!(registry.peer_fingerprint("SERIAL1"), None);
+        assert_eq!(registry.all().count(), 1);
+        assert_eq!(registry.paired_peers().count(), 1);
+        assert!(!registry.forget("dev1"));
+        assert!(registry.is_known("SERIAL1"));
+    }
 }
