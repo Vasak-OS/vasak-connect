@@ -4,6 +4,11 @@
 //! cannot drift apart: a field renamed on one end stops compiling on the other
 //! instead of silently becoming a device that never matches.
 
+/// El contrato de red teléfono↔escritorio. Vive aparte porque viaja por la red
+/// y no por D-Bus, y porque lo tiene que compilar también la app móvil sin
+/// `zbus`.
+pub mod wire;
+
 use serde::{Deserialize, Serialize};
 use zbus::zvariant::Type;
 
