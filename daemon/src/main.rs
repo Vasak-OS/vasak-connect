@@ -247,6 +247,16 @@ impl ConnectService {
     }
 
     // ── Canal de red teléfono↔escritorio ─────────────────────────────────────
+    //
+    // Estos métodos deciden con quién se parea y a quién se trata como de
+    // confianza. Como todo lo de este servicio, corren en el bus de **sesión**,
+    // como la persona conectada: cualquier proceso de esa sesión puede llamarlos.
+    // El pareo sólo se confirma desde `confirm_pairing` (la persona local), pero
+    // una llamada a `confirm_pairing` vale tanto como el aislamiento del bus de
+    // sesión —otro proceso de la misma sesión podría hacerla—. Esa frontera la
+    // cierra el confinamiento del proceso (AppArmor), no este servicio; acá no hay
+    // un secreto que un proceso de la sesión no pueda, de todos modos, sacar de
+    // otra forma.
 
     /// Los pares del canal que el servicio ve ahora: descubiertos por mDNS,
     /// conectados o pareados. Una fila por par: `device_id`, nombre, categoría,

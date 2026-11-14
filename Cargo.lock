@@ -1849,6 +1849,7 @@ dependencies = [
  "udev",
  "vasak-connect-protocol",
  "zbus",
+ "zeroize",
 ]
 
 [[package]]

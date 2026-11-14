@@ -41,6 +41,8 @@ mdns-sd = "0.13"
 # metería un segundo major de zbus en el binario); con las features por omisión
 # usa criptografía en Rust puro para la sesión cifrada con el llavero.
 oo7 = "0.6"
+# Borra de la memoria las copias intermedias de la clave privada tras usarlas.
+zeroize = "1"
 
 [dev-dependencies]
 # Pruebas de propiedad sobre lo que devuelven `adb` y `scrcpy`. Es lo único de

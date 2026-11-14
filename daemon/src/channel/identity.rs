@@ -17,6 +17,7 @@ use std::path::PathBuf;
 
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tracing::debug;
+use zeroize::Zeroizing;
 
 use super::pure::{device_id_from_fingerprint, fingerprint_from_der};
 
@@ -46,12 +47,18 @@ pub struct Identity {
 impl Identity {
     /// Arma la identidad a partir del certificado y la clave en DER, derivando la
     /// huella y el `device_id`. No toca red, llavero ni disco.
-    fn from_parts(cert_der: Vec<u8>, key_pkcs8_der: Vec<u8>) -> Self {
+    ///
+    /// La clave llega envuelta en [`Zeroizing`] para que esa copia intermedia se
+    /// borre de la memoria al salir. Queda una sola copia en claro —la que vive
+    /// dentro de `key_der` para que rustls firme con ella—, que por fuerza persiste
+    /// mientras el canal esté levantado; la frontera que la protege es el
+    /// aislamiento del proceso y del bus de sesión (mitigado por AppArmor).
+    fn from_parts(cert_der: Vec<u8>, key_pkcs8_der: Zeroizing<Vec<u8>>) -> Self {
         let fingerprint = fingerprint_from_der(&cert_der);
         let device_id = device_id_from_fingerprint(&fingerprint);
         Identity {
             cert_der: CertificateDer::from(cert_der),
-            key_der: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pkcs8_der)),
+            key_der: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pkcs8_der.to_vec())),
             fingerprint,
             device_id,
         }
@@ -102,19 +109,23 @@ fn cert_path() -> Option<PathBuf> {
 /// `ring` de rustls firma y verifica. El certificado va con un único SAN que no
 /// se usa para nada —no hay validación de nombre—, está sólo para que sea un
 /// certificado bien formado.
-fn generate() -> Result<(Vec<u8>, Vec<u8>), rcgen::Error> {
+fn generate() -> Result<(Vec<u8>, Zeroizing<Vec<u8>>), rcgen::Error> {
     let certified = rcgen::generate_simple_self_signed(vec!["vasak-connect".to_string()])?;
     let cert_der = certified.cert.der().to_vec();
-    let key_der = certified.signing_key.serialize_der();
+    // La clave en claro se envuelve en `Zeroizing` ni bien se genera, para que su
+    // copia intermedia se borre al moverla, no quede olvidada en el montón.
+    let key_der = Zeroizing::new(certified.signing_key.serialize_der());
     Ok((cert_der, key_der))
 }
 
 /// Lee la clave privada del Secret Service, si está.
-async fn load_key() -> Result<Option<Vec<u8>>, oo7::Error> {
+async fn load_key() -> Result<Option<Zeroizing<Vec<u8>>>, oo7::Error> {
     let keyring = oo7::Keyring::new().await?;
     let items = keyring.search_items(&secret_attributes()).await?;
     match items.first() {
-        Some(item) => Ok(Some(item.secret().await?.to_vec())),
+        // El `Secret` de oo7 ya se borra solo al soltarse; la copia que sacamos se
+        // envuelve en `Zeroizing` para que corra la misma suerte.
+        Some(item) => Ok(Some(Zeroizing::new(item.secret().await?.to_vec()))),
         None => Ok(None),
     }
 }
@@ -151,7 +162,9 @@ pub async fn load_or_create() -> Result<Identity, IdentityError> {
 
     debug!("sin identidad TLS completa: se genera una nueva");
     let (cert_der, key_der) = generate().map_err(IdentityError::Generate)?;
-    store_key(&key_der).await.map_err(IdentityError::Keyring)?;
+    store_key(&key_der[..])
+        .await
+        .map_err(IdentityError::Keyring)?;
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent)
             .await

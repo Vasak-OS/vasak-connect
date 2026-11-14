@@ -211,6 +211,12 @@ impl std::error::Error for HelloError {}
 /// segundo ata el `Hello` a la conexión: sin eso, un par podría declarar la
 /// huella de otro y hacerse pasar por él a nivel de aplicación aunque el
 /// certificado del TLS fuera distinto.
+///
+/// El `device_id` que el par declara **no** se valida acá a propósito: no se
+/// confía en él. El canal lo deriva por su cuenta de la huella del certificado
+/// con [`device_id_from_fingerprint`] y usa ése, así que el que elija el par da
+/// igual y no hace falta rechazarlo (lo que además ataría la identidad a un campo
+/// que el par controla).
 pub fn verify_hello(peer: &PeerInfo, tls_fingerprint: &str) -> Result<(), HelloError> {
     if !protocol_compatible(peer.protocol_version) {
         return Err(HelloError::IncompatibleVersion(peer.protocol_version));
@@ -226,6 +232,190 @@ pub fn verify_hello(peer: &PeerInfo, tls_fingerprint: &str) -> Result<(), HelloE
 /// no vuelva a implementarlo.
 pub fn verification_code(own_fingerprint: &str, peer_fingerprint: &str) -> String {
     wire::verification_code(own_fingerprint, peer_fingerprint)
+}
+
+// ── Máquina de estados del pareo ─────────────────────────────────────────────
+//
+// La invariante que esta máquina hace cumplir: **un par se fija como de confianza
+// SÓLO cuando la persona local confirma el código** (`PairingEvent::LocalConfirm
+// { accept: true }` sobre un pareo pendiente). Ningún mensaje del par —ni un
+// `PairResponse { accepted: true }` no pedido— vuelve a un par de confianza por
+// sí solo. Toda la lógica del pareo pasa por `advance_pairing`, que es pura: el
+// código de red sólo aplica lo que ésta decide (mandar un mensaje, fijar, avisar).
+
+/// El estado del pareo de una sesión.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum PairingState {
+    /// Sin pareo en curso.
+    #[default]
+    Idle,
+    /// Nosotros pedimos parear y esperamos: que la persona local confirme el
+    /// código, y que el par conteste que acepta. `peer_accepted` dice si el par ya
+    /// contestó que sí; aun así no se fija hasta la confirmación local.
+    OutgoingPending { code: String, peer_accepted: bool },
+    /// El par pidió parear y esperamos la confirmación local.
+    IncomingPending { code: String },
+}
+
+/// Lo que mueve la máquina de pareo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PairingEvent {
+    /// La persona local pidió iniciar el pareo (`request_pairing`).
+    LocalInitiate { code: String },
+    /// Llegó un `PairRequest` del par.
+    PeerRequest { code: String },
+    /// Llegó un `PairResponse` del par.
+    PeerResponse { accepted: bool },
+    /// La persona local confirmó o rechazó (`confirm_pairing`).
+    LocalConfirm { accept: bool },
+}
+
+/// Qué hacer tras un evento: a qué estado pasar, qué mandarle al par, si fijarlo
+/// como de confianza, y si avisar a la persona con un código.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairingAction {
+    pub next: PairingState,
+    /// Mensaje a mandarle al par, si corresponde.
+    pub send: Option<Message>,
+    /// Fijar al par como de confianza. **Sólo es `true` en respuesta a
+    /// `LocalConfirm { accept: true }` sobre un pareo pendiente.**
+    pub pin: bool,
+    /// Código a mostrarle a la persona (emitir `pairing_requested`), si hay que
+    /// pedirle una confirmación.
+    pub notify_code: Option<String>,
+}
+
+impl PairingAction {
+    /// Un no-op: se queda como está y no hace nada. Es la respuesta a cualquier
+    /// evento que no corresponde al estado —entre ellos un `PairResponse` sin un
+    /// pedido saliente pendiente, que es justo lo que no debe fijar nada.
+    fn noop(state: &PairingState) -> Self {
+        PairingAction {
+            next: state.clone(),
+            send: None,
+            pin: false,
+            notify_code: None,
+        }
+    }
+}
+
+/// La transición de la máquina de pareo. Pura: no toca red, estado compartido ni
+/// reloj; devuelve qué hacer y el código de red lo aplica.
+pub fn advance_pairing(state: &PairingState, event: PairingEvent) -> PairingAction {
+    match (state, event) {
+        // Iniciamos nosotros: mandamos el pedido y le mostramos el código a la
+        // persona para que lo confirme.
+        (PairingState::Idle, PairingEvent::LocalInitiate { code }) => PairingAction {
+            next: PairingState::OutgoingPending {
+                code: code.clone(),
+                peer_accepted: false,
+            },
+            send: Some(Message::PairRequest {
+                verification: code.clone(),
+            }),
+            pin: false,
+            notify_code: Some(code),
+        },
+
+        // El par pide parear: mostramos el código y esperamos la confirmación
+        // local. No se fija nada acá.
+        (PairingState::Idle, PairingEvent::PeerRequest { code }) => PairingAction {
+            next: PairingState::IncomingPending { code: code.clone() },
+            send: None,
+            pin: false,
+            notify_code: Some(code),
+        },
+
+        // El par acepta nuestro pedido: lo anotamos, pero **no se fija**: falta la
+        // confirmación local. Se vuelve a mostrar el código para que la persona
+        // pueda confirmar.
+        (
+            PairingState::OutgoingPending { code, .. },
+            PairingEvent::PeerResponse { accepted: true },
+        ) => PairingAction {
+            next: PairingState::OutgoingPending {
+                code: code.clone(),
+                peer_accepted: true,
+            },
+            send: None,
+            pin: false,
+            notify_code: Some(code.clone()),
+        },
+
+        // El par rechaza nuestro pedido: se cancela.
+        (PairingState::OutgoingPending { .. }, PairingEvent::PeerResponse { accepted: false }) => {
+            PairingAction {
+                next: PairingState::Idle,
+                send: None,
+                pin: false,
+                notify_code: None,
+            }
+        }
+
+        // La persona confirma un pedido saliente: **acá sí se fija**. No hace
+        // falta avisarle nada más al par: pareó cuando su propia persona aceptó.
+        (PairingState::OutgoingPending { .. }, PairingEvent::LocalConfirm { accept: true }) => {
+            PairingAction {
+                next: PairingState::Idle,
+                send: None,
+                pin: true,
+                notify_code: None,
+            }
+        }
+
+        // La persona confirma un pedido entrante: se fija y se le contesta que sí
+        // al par.
+        (PairingState::IncomingPending { .. }, PairingEvent::LocalConfirm { accept: true }) => {
+            PairingAction {
+                next: PairingState::Idle,
+                send: Some(Message::PairResponse { accepted: true }),
+                pin: true,
+                notify_code: None,
+            }
+        }
+
+        // La persona rechaza un pedido entrante: se le avisa al par que no.
+        (PairingState::IncomingPending { .. }, PairingEvent::LocalConfirm { accept: false }) => {
+            PairingAction {
+                next: PairingState::Idle,
+                send: Some(Message::PairResponse { accepted: false }),
+                pin: false,
+                notify_code: None,
+            }
+        }
+
+        // La persona rechaza un pedido saliente: se cancela sin fijar.
+        (PairingState::OutgoingPending { .. }, PairingEvent::LocalConfirm { accept: false }) => {
+            PairingAction {
+                next: PairingState::Idle,
+                send: None,
+                pin: false,
+                notify_code: None,
+            }
+        }
+
+        // Todo lo demás no corresponde al estado y no hace nada. En particular, un
+        // `PairResponse` sin un pedido saliente pendiente (estado `Idle`) es un
+        // no-op: no fija, no avisa. Es el caso que cierra el agujero de fijar un
+        // par porque mandó `accepted: true` sin que nadie se lo pidiera.
+        (state, _) => PairingAction::noop(state),
+    }
+}
+
+// ── Límites contra abuso (DoS) ───────────────────────────────────────────────
+
+/// Si se admite una conexión nueva, dado cuántas sesiones hay abiertas y el tope.
+/// Un par (o algo que se haga pasar por varios) no debe poder abrir sesiones sin
+/// fin y agotar la memoria del servicio.
+pub fn accept_new_session(current: usize, max: usize) -> bool {
+    current < max
+}
+
+/// Si una sesión agotó su presupuesto de keepalive: mandó `Ping` y el par no
+/// contestó `Pong` las últimas `max` veces seguidas. Una sesión así se cierra en
+/// vez de quedar colgada ocupando memoria.
+pub fn keepalive_exhausted(missed_pongs: u32, max: u32) -> bool {
+    missed_pongs >= max
 }
 
 // ── Anuncio mDNS: registro TXT ───────────────────────────────────────────────

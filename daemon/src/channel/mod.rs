@@ -23,19 +23,36 @@ use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
-use tokio::time::interval;
+use tokio::time::{interval, timeout};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tracing::{debug, info, warn};
 use vasak_connect_protocol::wire::{DeviceKind, Message, PeerInfo, PROTOCOL_VERSION};
 
 use crate::{notify, State};
 use identity::Identity;
-use pure::{evaluate_peer_cert, parse_peer_txt, self_name, verification_code, TrustDecision};
+use pure::{
+    accept_new_session, advance_pairing, device_id_from_fingerprint, evaluate_peer_cert,
+    keepalive_exhausted, parse_peer_txt, self_name, verification_code, PairingEvent, PairingState,
+    TrustDecision,
+};
 use transport::{peer_fingerprint, read_frame, write_frame, SessionError};
 
 /// Cada cuánto se manda un `Ping` para mantener viva la sesión y notar un corte
 /// que el socket todavía no reportó.
 const KEEPALIVE: Duration = Duration::from_secs(30);
+
+/// Cuántos `Ping` seguidos sin `Pong` se toleran antes de cerrar la sesión. Una
+/// sesión que dejó de contestar no debe quedar colgada ocupando memoria.
+const MAX_MISSED_PONGS: u32 = 3;
+
+/// Tope de sesiones abiertas a la vez. Lo abre cualquiera que alcance el puerto,
+/// sin estar pareado, así que tiene un techo para que no se pueda agotar la
+/// memoria del servicio abriendo conexiones sin fin.
+const MAX_CONCURRENT_SESSIONS: usize = 32;
+
+/// Lo que se le da al handshake y al primer `Hello` para completarse. Una
+/// conexión que abre el socket y no habla no debe retener una tarea para siempre.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Lo que un par anunció por mDNS y dónde alcanzarlo.
 pub struct Discovered {
@@ -58,6 +75,10 @@ pub struct Session {
     /// confirma el pareo sin volver a bajar a la capa de TLS.
     pub fingerprint: String,
     pub paired: bool,
+    /// El estado del pareo de esta sesión. Toda la lógica pasa por
+    /// [`advance_pairing`]: fijar al par depende de este estado, no de un mensaje
+    /// suelto que mande el par.
+    pair: PairingState,
     outbound: mpsc::UnboundedSender<Outbound>,
 }
 
@@ -264,13 +285,16 @@ pub async fn run(connection: zbus::Connection, state: Arc<Mutex<State>>) {
                         let state = state.clone();
                         let connection = connection.clone();
                         tokio::spawn(async move {
-                            match acceptor.accept(stream).await {
-                                Ok(tls) => {
+                            // El handshake tiene un plazo: una conexión que abre el
+                            // socket y no completa el TLS no debe retener la tarea.
+                            match timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
+                                Ok(Ok(tls)) => {
                                     let (_, server_conn) = tls.get_ref();
                                     let fingerprint = peer_fingerprint(server_conn.peer_certificates());
                                     handle_session(tls, fingerprint, false, state, connection).await;
                                 }
-                                Err(err) => debug!(%err, "handshake entrante fallido"),
+                                Ok(Err(err)) => debug!(%err, "handshake entrante fallido"),
+                                Err(_) => debug!("handshake entrante sin completar a tiempo"),
                             }
                         });
                     }
@@ -290,18 +314,23 @@ pub async fn run(connection: zbus::Connection, state: Arc<Mutex<State>>) {
                         let Some(address) = address else { continue };
 
                         // Si ya hay una sesión abierta con ese par, el pareo va
-                        // por ella; sólo se abre una nueva si no la hay.
-                        let already = {
+                        // por ella (por la máquina de pareo, no mandando a mano);
+                        // sólo se abre una nueva si no la hay.
+                        let session_peer = {
                             let guard = state.lock().await;
                             guard.channel.as_ref()
-                                .is_some_and(|ch| ch.sessions.contains_key(&device_id))
+                                .and_then(|ch| ch.sessions.get(&device_id))
+                                .map(|s| (s.fingerprint.clone(), s.name.clone()))
                         };
-                        if already {
-                            let guard = state.lock().await;
-                            if let Some(ch) = guard.channel.as_ref() {
-                                let code = verification_code(&identity.fingerprint,
-                                    ch.sessions.get(&device_id).map(|s| s.fingerprint.as_str()).unwrap_or(""));
-                                ch.send_to(&device_id, Message::PairRequest { verification: code });
+                        if let Some((peer_fp, peer_name)) = session_peer {
+                            let code = verification_code(&identity.fingerprint, &peer_fp);
+                            if let Some(action) =
+                                step_pairing(&state, &device_id, PairingEvent::LocalInitiate { code }).await
+                            {
+                                apply_pairing_over_outbound(
+                                    action, &device_id, &peer_name, &peer_fp, &state, &connection,
+                                )
+                                .await;
                             }
                             continue;
                         }
@@ -374,14 +403,20 @@ async fn handle_session<S>(
         return;
     }
 
-    let peer = match read_frame(&mut reader).await {
-        Ok(Message::Hello(peer)) => peer,
-        Ok(other) => {
+    // El `Hello` tiene un plazo: una conexión que abre el socket y no habla no
+    // debe retener esta tarea para siempre.
+    let peer = match timeout(HANDSHAKE_TIMEOUT, read_frame(&mut reader)).await {
+        Ok(Ok(Message::Hello(peer))) => peer,
+        Ok(Ok(other)) => {
             debug!(?other, "el primer mensaje no fue un Hello");
             return;
         }
-        Err(err) => {
+        Ok(Err(err)) => {
             debug!(%err, "no llegó el Hello del par");
+            return;
+        }
+        Err(_) => {
+            debug!("el par no mandó el Hello a tiempo");
             return;
         }
     };
@@ -391,7 +426,10 @@ async fn handle_session<S>(
         return;
     }
 
-    let device_id = peer.device_id.clone();
+    // El `device_id` se deriva de la huella del certificado, **no** se toma el que
+    // el par declara: así la identidad con la que se lo recuerda y se decide la
+    // confianza queda atada al certificado, no a un campo que el par elige.
+    let device_id = device_id_from_fingerprint(&fingerprint);
 
     // Decisión de confianza contra la huella fijada.
     let decision = {
@@ -408,13 +446,21 @@ async fn handle_session<S>(
     }
     let paired = decision == TrustDecision::Trusted;
 
-    // Registrar la sesión y su canal de salida.
+    // Registrar la sesión y su canal de salida. Con un tope de sesiones abiertas:
+    // reemplazar una del mismo par está bien, pero una conexión nueva de un par
+    // distinto se rechaza si ya se llegó al techo, para que no se pueda agotar la
+    // memoria abriendo conexiones sin fin.
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Outbound>();
     {
         let mut guard = state.lock().await;
         let Some(ch) = guard.channel.as_mut() else {
             return;
         };
+        let replacing = ch.sessions.contains_key(&device_id);
+        if !replacing && !accept_new_session(ch.sessions.len(), MAX_CONCURRENT_SESSIONS) {
+            warn!(%device_id, "se alcanzó el tope de sesiones del canal: se rechaza");
+            return;
+        }
         ch.discovered.remove(&device_id);
         ch.sessions.insert(
             device_id.clone(),
@@ -423,6 +469,7 @@ async fn handle_session<S>(
                 kind: peer.kind,
                 fingerprint: fingerprint.clone(),
                 paired,
+                pair: PairingState::Idle,
                 outbound: out_tx,
             },
         );
@@ -430,29 +477,38 @@ async fn handle_session<S>(
     emit_peer_changed(&connection).await;
     info!(%device_id, paired, "sesión del canal abierta");
 
-    // Si somos nosotros los que iniciamos el pareo, pedirlo ahora.
+    // Si somos nosotros los que iniciamos el pareo, pedirlo ahora: la máquina de
+    // pareo decide qué mandar y qué mostrarle a la persona.
     if initiate_pair && !paired {
         let code = verification_code(&own.fingerprint, &fingerprint);
-        if write_frame(
-            &mut writer,
-            &Message::PairRequest {
-                verification: code.clone(),
-            },
-        )
-        .await
-        .is_ok()
+        if let Some(action) =
+            step_pairing(&state, &device_id, PairingEvent::LocalInitiate { code }).await
         {
-            emit_pairing_requested(&connection, &device_id, &peer.name, &code).await;
+            apply_pairing_over_writer(
+                action,
+                &device_id,
+                &peer.name,
+                &fingerprint,
+                &mut writer,
+                &state,
+                &connection,
+            )
+            .await;
         }
     }
 
     let mut keepalive = interval(KEEPALIVE);
     keepalive.tick().await; // el primer tick es inmediato; lo descartamos
+    let mut missed_pongs: u32 = 0;
 
     loop {
         tokio::select! {
             incoming = read_frame(&mut reader) => {
                 match incoming {
+                    // El `Pong` es la respuesta al keepalive: pone a cero la cuenta
+                    // de los que faltan. Se mira acá, en el bucle, porque la cuenta
+                    // vive acá.
+                    Ok(Message::Pong) => { missed_pongs = 0; }
                     Ok(message) => {
                         if !handle_message(message, &device_id, &peer, &fingerprint, &mut writer, &state, &connection).await {
                             break;
@@ -481,9 +537,16 @@ async fn handle_session<S>(
             }
 
             _ = keepalive.tick() => {
+                // Si el par no contestó los últimos `Ping`, se da por caído y se
+                // cierra en vez de seguir mandando a una sesión muerta.
+                if keepalive_exhausted(missed_pongs, MAX_MISSED_PONGS) {
+                    debug!(%device_id, "el par dejó de contestar el keepalive: se cierra");
+                    break;
+                }
                 if write_frame(&mut writer, &Message::Ping).await.is_err() {
                     break;
                 }
+                missed_pongs += 1;
             }
         }
     }
@@ -514,35 +577,61 @@ where
 {
     match message {
         Message::Ping => write_frame(writer, &Message::Pong).await.is_ok(),
+        // El `Pong` lo mira el bucle de la sesión (pone a cero el keepalive); si
+        // llega acá, no hay nada que hacer.
         Message::Pong => true,
         Message::PairRequest { verification } => {
-            // El par quiere parear: se guarda como pendiente y se le avisa a la
-            // persona con el código, que debe coincidir con el que ve el par.
-            {
-                let mut guard = state.lock().await;
-                if let Some(ch) = guard.channel.as_mut() {
-                    if let Some(session) = ch.sessions.get_mut(device_id) {
-                        session.fingerprint = fingerprint.to_string();
-                    }
-                }
-            }
-            emit_pairing_requested(connection, device_id, &peer.name, &verification).await;
-            notify::send(
-                connection,
-                &format!("{} quiere conectarse", peer.name),
-                &format!("Confirmá el código {verification} para parear."),
-                notify::PHONE_ICON,
+            // El par quiere parear. La máquina decide (estado `IncomingPending`,
+            // mostrar el código); **no se fija nada** hasta la confirmación local.
+            if let Some(action) = step_pairing(
+                state,
+                device_id,
+                PairingEvent::PeerRequest {
+                    code: verification.clone(),
+                },
             )
-            .await;
+            .await
+            {
+                // El aviso del sistema es sólo para un pedido entrante nuevo.
+                if action.notify_code.is_some() {
+                    notify::send(
+                        connection,
+                        &format!("{} quiere conectarse", peer.name),
+                        &format!("Confirmá el código {verification} para parear."),
+                        notify::PHONE_ICON,
+                    )
+                    .await;
+                }
+                apply_pairing_over_writer(
+                    action,
+                    device_id,
+                    &peer.name,
+                    fingerprint,
+                    writer,
+                    state,
+                    connection,
+                )
+                .await;
+            }
             true
         }
         Message::PairResponse { accepted } => {
-            if accepted {
-                pin_peer(state, device_id, &peer.name, fingerprint).await;
-                emit_peer_changed(connection).await;
-                info!(%device_id, "el par aceptó el pareo");
-            } else {
-                debug!(%device_id, "el par rechazó el pareo");
+            // Honrar un `PairResponse` sólo tiene sentido si hay un pedido saliente
+            // nuestro pendiente; si no, la máquina lo ignora. Y aun cuando es
+            // válido, **no fija**: espera la confirmación local.
+            if let Some(action) =
+                step_pairing(state, device_id, PairingEvent::PeerResponse { accepted }).await
+            {
+                apply_pairing_over_writer(
+                    action,
+                    device_id,
+                    &peer.name,
+                    fingerprint,
+                    writer,
+                    state,
+                    connection,
+                )
+                .await;
             }
             true
         }
@@ -568,6 +657,80 @@ where
             debug!(%device_id, ?other, "mensaje aún no manejado");
             true
         }
+    }
+}
+
+/// Hace avanzar la máquina de pareo de una sesión con un evento y guarda el
+/// estado nuevo. Devuelve la acción a aplicar, o `None` si no hay sesión.
+///
+/// Es el único lugar donde se decide el pareo: la decisión es pura
+/// ([`advance_pairing`]); acá sólo se lee y se escribe el estado de la sesión.
+async fn step_pairing(
+    state: &Arc<Mutex<State>>,
+    device_id: &str,
+    event: PairingEvent,
+) -> Option<pure::PairingAction> {
+    let mut guard = state.lock().await;
+    let ch = guard.channel.as_mut()?;
+    let session = ch.sessions.get_mut(device_id)?;
+    let action = advance_pairing(&session.pair, event);
+    session.pair = action.next.clone();
+    Some(action)
+}
+
+/// Aplica una acción de pareo cuando se tiene el `writer` de la sesión a mano
+/// (en el bucle o al iniciar): manda el mensaje que corresponda, avisa a la
+/// persona con el código, y fija al par si la acción lo indica.
+async fn apply_pairing_over_writer<W>(
+    action: pure::PairingAction,
+    device_id: &str,
+    peer_name: &str,
+    fingerprint: &str,
+    writer: &mut W,
+    state: &Arc<Mutex<State>>,
+    connection: &zbus::Connection,
+) where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    if let Some(message) = &action.send {
+        let _ = write_frame(writer, message).await;
+    }
+    if let Some(code) = &action.notify_code {
+        emit_pairing_requested(connection, device_id, peer_name, code).await;
+    }
+    if action.pin {
+        pin_peer(state, device_id, peer_name, fingerprint).await;
+        emit_peer_changed(connection).await;
+        info!(%device_id, "par fijado tras la confirmación local");
+    }
+}
+
+/// Aplica una acción de pareo cuando el mensaje va por el canal de salida de la
+/// sesión (desde un método de D-Bus, sin el `writer` a mano). Mismo efecto que
+/// [`apply_pairing_over_writer`], pero el envío va por [`ChannelRuntime::send_to`].
+async fn apply_pairing_over_outbound(
+    action: pure::PairingAction,
+    device_id: &str,
+    peer_name: &str,
+    fingerprint: &str,
+    state: &Arc<Mutex<State>>,
+    connection: &zbus::Connection,
+) {
+    if action.pin {
+        pin_peer(state, device_id, peer_name, fingerprint).await;
+    }
+    if let Some(message) = action.send {
+        let guard = state.lock().await;
+        if let Some(ch) = guard.channel.as_ref() {
+            ch.send_to(device_id, message);
+        }
+    }
+    if let Some(code) = &action.notify_code {
+        emit_pairing_requested(connection, device_id, peer_name, code).await;
+    }
+    if action.pin {
+        emit_peer_changed(connection).await;
+        info!(%device_id, "par fijado tras la confirmación local");
     }
 }
 
@@ -717,44 +880,49 @@ async fn handle_removed(fullname: &str, state: &Arc<Mutex<State>>, connection: &
 
 // ── Superficie para los metodos de D-Bus ─────────────────────────────────────
 
-/// Resuelve un pedido de pareo entrante: fija o descarta según la persona.
+/// Confirma o rechaza un pareo **desde la persona local**. Es el único camino por
+/// el que un par queda fijado como de confianza.
 ///
-/// Devuelve si había un par con sesión al que contestarle.
+/// Sólo hace algo si hay un pareo pendiente para ese par (un pedido entrante o uno
+/// saliente nuestro); un `confirm_pairing` sobre un par sin nada pendiente no fija
+/// nada. La decisión (fijar, qué contestarle al par) sale de [`advance_pairing`].
+/// Devuelve si había un pareo pendiente que resolver.
 pub async fn confirm_pairing(
     state: &Arc<Mutex<State>>,
     connection: &zbus::Connection,
     device_id: &str,
     accept: bool,
 ) -> bool {
-    let (found, name, fingerprint) = {
-        let guard = state.lock().await;
-        match guard
-            .channel
-            .as_ref()
-            .and_then(|ch| ch.sessions.get(device_id))
-        {
-            Some(session) => (true, session.name.clone(), session.fingerprint.clone()),
-            None => (false, String::new(), String::new()),
+    // Hacer avanzar la máquina con la confirmación local, leyendo de paso nombre y
+    // huella para fijar. Si no hay pareo pendiente (`Idle`), no se hace nada.
+    let (action, name, fingerprint) = {
+        let mut guard = state.lock().await;
+        let Some(ch) = guard.channel.as_mut() else {
+            return false;
+        };
+        let Some(session) = ch.sessions.get_mut(device_id) else {
+            return false;
+        };
+        if matches!(session.pair, PairingState::Idle) {
+            return false;
         }
+        let name = session.name.clone();
+        let fingerprint = session.fingerprint.clone();
+        let action = advance_pairing(&session.pair, PairingEvent::LocalConfirm { accept });
+        session.pair = action.next.clone();
+        (action, name, fingerprint)
     };
-    if !found {
-        return false;
-    }
 
-    if accept {
-        pin_peer(state, device_id, &name, &fingerprint).await;
-    }
-
-    {
+    apply_pairing_over_outbound(action, device_id, &name, &fingerprint, state, connection).await;
+    // Un rechazo cierra la sesión: ya se le mandó el `PairResponse { false }`.
+    if !accept {
         let guard = state.lock().await;
         if let Some(ch) = guard.channel.as_ref() {
-            ch.send_to(device_id, Message::PairResponse { accepted: accept });
-            if !accept {
-                ch.shutdown(device_id);
-            }
+            ch.shutdown(device_id);
         }
+        drop(guard);
+        emit_peer_changed(connection).await;
     }
-    emit_peer_changed(connection).await;
     true
 }
 
