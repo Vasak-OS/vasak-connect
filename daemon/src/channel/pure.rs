@@ -908,4 +908,65 @@ mod tests {
         assert!(keepalive_exhausted(3, 3));
         assert!(keepalive_exhausted(4, 3));
     }
+
+    #[test]
+    fn en_el_tope_un_par_nuevo_se_rechaza_y_uno_existente_reemplaza() {
+        // La defensa contra el DoS: en el tope no entran pares nuevos, pero quien
+        // ya tiene sesión puede reconectar sin que el mapa crezca.
+        assert_eq!(admit_session(false, 3, 3), SessionAdmission::Reject);
+        assert_eq!(admit_session(false, 9, 3), SessionAdmission::Reject);
+        assert_eq!(admit_session(true, 3, 3), SessionAdmission::Replace);
+    }
+
+    #[test]
+    fn con_lugar_y_sin_sesion_previa_se_admite() {
+        assert_eq!(admit_session(false, 0, 3), SessionAdmission::Admit);
+        assert_eq!(admit_session(false, 2, 3), SessionAdmission::Admit);
+    }
+
+    #[test]
+    fn un_slot_ocupado_siempre_reemplaza() {
+        assert_eq!(admit_session(true, 0, 3), SessionAdmission::Replace);
+        assert_eq!(admit_session(true, 1, 3), SessionAdmission::Replace);
+        assert_eq!(admit_session(true, 99, 3), SessionAdmission::Replace);
+    }
+
+    #[test]
+    fn la_limpieza_solo_borra_la_entrada_propia() {
+        assert!(owns_session_slot(Some(7), 7));
+        // Entró una sesión de reemplazo: la vieja no es dueña del slot.
+        assert!(!owns_session_slot(Some(8), 7));
+        assert!(!owns_session_slot(None, 7));
+    }
+
+    #[test]
+    fn un_codigo_declarado_que_no_coincide_se_ignora() {
+        let real = verification_code("AA:BB", "CC:DD");
+        assert_eq!(checked_incoming_code("AA:BB", "CC:DD", "000000"), None);
+        assert_eq!(checked_incoming_code("AA:BB", "CC:DD", ""), None);
+        // Un intermediario que declara el código de otro par de huellas.
+        let ajeno = verification_code("AA:BB", "EE:FF");
+        assert_ne!(ajeno, real);
+        assert_eq!(checked_incoming_code("AA:BB", "CC:DD", &ajeno), None);
+    }
+
+    #[test]
+    fn un_codigo_correcto_devuelve_el_recalculado_localmente() {
+        let real = verification_code("AA:BB", "CC:DD");
+        assert_eq!(
+            checked_incoming_code("AA:BB", "CC:DD", &real),
+            Some(real.clone())
+        );
+        // El código no depende de cuál huella es la propia.
+        assert_eq!(
+            checked_incoming_code("CC:DD", "AA:BB", &real),
+            Some(real.clone())
+        );
+        // Lo declarado se compara exacto: con espacios no es el mismo código, y lo
+        // que se devuelve nunca es el texto del par.
+        assert_eq!(
+            checked_incoming_code("AA:BB", "CC:DD", &format!(" {real} ")),
+            None
+        );
+    }
 }
