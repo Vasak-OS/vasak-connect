@@ -17,6 +17,7 @@ pub mod transport;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,11 +32,15 @@ use vasak_connect_protocol::wire::{DeviceKind, Message, PeerInfo, PROTOCOL_VERSI
 use crate::{notify, State};
 use identity::Identity;
 use pure::{
-    accept_new_session, advance_pairing, device_id_from_fingerprint, evaluate_peer_cert,
-    keepalive_exhausted, parse_peer_txt, self_name, verification_code, PairingEvent, PairingState,
-    TrustDecision,
+    admit_session, advance_pairing, checked_incoming_code, device_id_from_fingerprint,
+    evaluate_peer_cert, keepalive_exhausted, owns_session_slot, parse_peer_txt, self_name,
+    verification_code, PairingEvent, PairingState, SessionAdmission, TrustDecision,
 };
 use transport::{peer_fingerprint, read_frame, write_frame, SessionError};
+
+/// Numerador de sesiones: le da a cada `handle_session` un id único, para que la
+/// limpieza de una sesión vieja no toque la entrada de una de reemplazo.
+static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Cada cuánto se manda un `Ping` para mantener viva la sesión y notar un corte
 /// que el socket todavía no reportó.
@@ -79,6 +84,9 @@ pub struct Session {
     /// [`advance_pairing`]: fijar al par depende de este estado, no de un mensaje
     /// suelto que mande el par.
     pair: PairingState,
+    /// Id único de esta sesión. Distingue una sesión de su reemplazo para que la
+    /// limpieza de la vieja no borre la entrada de la nueva.
+    session_id: u64,
     outbound: mpsc::UnboundedSender<Outbound>,
 }
 
@@ -284,6 +292,11 @@ pub async fn run(connection: zbus::Connection, state: Arc<Mutex<State>>) {
                         let acceptor = acceptor.clone();
                         let state = state.clone();
                         let connection = connection.clone();
+                        // Residual conocido: cada `accept` arranca una tarea antes de
+                        // chequear el tope de sesiones; la cantidad de tareas en
+                        // pre-sesión (handshake + primer Hello) la acota
+                        // `HANDSHAKE_TIMEOUT`, no un techo propio. Si hiciera falta un
+                        // tope duro de conexiones a la vez, iría un semáforo acá.
                         tokio::spawn(async move {
                             // El handshake tiene un plazo: una conexión que abre el
                             // socket y no completa el TLS no debe retener la tarea.
@@ -446,20 +459,35 @@ async fn handle_session<S>(
     }
     let paired = decision == TrustDecision::Trusted;
 
-    // Registrar la sesión y su canal de salida. Con un tope de sesiones abiertas:
-    // reemplazar una del mismo par está bien, pero una conexión nueva de un par
-    // distinto se rechaza si ya se llegó al techo, para que no se pueda agotar la
-    // memoria abriendo conexiones sin fin.
+    // Registrar la sesión y su canal de salida. El tope de sesiones acota el gasto
+    // de memoria; un par que reconecta con el mismo certificado **reemplaza** su
+    // sesión en vez de sumar una, y para que eso acote de verdad hay que terminar
+    // la sesión vieja —si no, su tarea queda colgada hasta agotar el keepalive—.
+    let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Outbound>();
     {
         let mut guard = state.lock().await;
         let Some(ch) = guard.channel.as_mut() else {
             return;
         };
-        let replacing = ch.sessions.contains_key(&device_id);
-        if !replacing && !accept_new_session(ch.sessions.len(), MAX_CONCURRENT_SESSIONS) {
-            warn!(%device_id, "se alcanzó el tope de sesiones del canal: se rechaza");
-            return;
+        match admit_session(
+            ch.sessions.contains_key(&device_id),
+            ch.sessions.len(),
+            MAX_CONCURRENT_SESSIONS,
+        ) {
+            SessionAdmission::Reject => {
+                warn!(%device_id, "se alcanzó el tope de sesiones del canal: se rechaza");
+                return;
+            }
+            SessionAdmission::Replace => {
+                // Terminar la sesión vieja antes de poner la nueva. Su tarea sale
+                // del bucle al recibir `Shutdown`; su limpieza no tocará esta
+                // entrada porque compara el id de sesión.
+                if let Some(old) = ch.sessions.get(&device_id) {
+                    let _ = old.outbound.send(Outbound::Shutdown);
+                }
+            }
+            SessionAdmission::Admit => {}
         }
         ch.discovered.remove(&device_id);
         ch.sessions.insert(
@@ -470,6 +498,7 @@ async fn handle_session<S>(
                 fingerprint: fingerprint.clone(),
                 paired,
                 pair: PairingState::Idle,
+                session_id,
                 outbound: out_tx,
             },
         );
@@ -510,7 +539,7 @@ async fn handle_session<S>(
                     // vive acá.
                     Ok(Message::Pong) => { missed_pongs = 0; }
                     Ok(message) => {
-                        if !handle_message(message, &device_id, &peer, &fingerprint, &mut writer, &state, &connection).await {
+                        if !handle_message(message, &device_id, &peer, &own.fingerprint, &fingerprint, &mut writer, &state, &connection).await {
                             break;
                         }
                     }
@@ -551,11 +580,17 @@ async fn handle_session<S>(
         }
     }
 
-    // Limpieza al cerrar.
+    // Limpieza al cerrar. Se borra la entrada **sólo si sigue siendo la de esta
+    // sesión**: si entró una de reemplazo con el mismo `device_id`, su entrada es
+    // otra (otro `session_id`) y no hay que borrarla acá, o la sesión viva quedaría
+    // inalcanzable.
     {
         let mut guard = state.lock().await;
         if let Some(ch) = guard.channel.as_mut() {
-            ch.sessions.remove(&device_id);
+            let current = ch.sessions.get(&device_id).map(|s| s.session_id);
+            if owns_session_slot(current, session_id) {
+                ch.sessions.remove(&device_id);
+            }
         }
     }
     emit_peer_changed(&connection).await;
@@ -563,10 +598,18 @@ async fn handle_session<S>(
 }
 
 /// Procesa un mensaje entrante. Devuelve `false` si la sesión debe cerrarse.
+///
+/// `own_fingerprint` es la huella propia y `fingerprint` la del par en esta
+/// sesión; con las dos se recalcula localmente el código del pareo entrante.
+// Son muchos parámetros, pero cada uno es un dato distinto que el despacho de un
+// mensaje necesita (quién, con qué huellas, por dónde contestar y a dónde emitir);
+// juntarlos en una estructura sólo para la cuenta no lo haría más claro.
+#[allow(clippy::too_many_arguments)]
 async fn handle_message<W>(
     message: Message,
     device_id: &str,
     peer: &PeerInfo,
+    own_fingerprint: &str,
     fingerprint: &str,
     writer: &mut W,
     state: &Arc<Mutex<State>>,
@@ -581,23 +624,31 @@ where
         // llega acá, no hay nada que hacer.
         Message::Pong => true,
         Message::PairRequest { verification } => {
+            // El código se **recalcula localmente** con las dos huellas: el que
+            // manda el par no se muestra ni se cree. Si no coincide con el local, el
+            // pareo se ignora —es la señal de un intermediario en el primer pareo—.
+            let Some(code) = checked_incoming_code(own_fingerprint, fingerprint, &verification)
+            else {
+                debug!(%device_id, "código de pareo entrante no coincide con el recalculado: se ignora");
+                return true;
+            };
+
             // El par quiere parear. La máquina decide (estado `IncomingPending`,
             // mostrar el código); **no se fija nada** hasta la confirmación local.
             if let Some(action) = step_pairing(
                 state,
                 device_id,
-                PairingEvent::PeerRequest {
-                    code: verification.clone(),
-                },
+                PairingEvent::PeerRequest { code: code.clone() },
             )
             .await
             {
-                // El aviso del sistema es sólo para un pedido entrante nuevo.
+                // El aviso del sistema es sólo para un pedido entrante nuevo, y con
+                // el código recalculado localmente.
                 if action.notify_code.is_some() {
                     notify::send(
                         connection,
                         &format!("{} quiere conectarse", peer.name),
-                        &format!("Confirmá el código {verification} para parear."),
+                        &format!("Confirmá el código {code} para parear."),
                         notify::PHONE_ICON,
                     )
                     .await;

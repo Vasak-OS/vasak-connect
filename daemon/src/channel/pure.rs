@@ -418,6 +418,63 @@ pub fn keepalive_exhausted(missed_pongs: u32, max: u32) -> bool {
     missed_pongs >= max
 }
 
+/// Qué hacer con una conexión que llega, según si ya hay una sesión con ese par.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionAdmission {
+    /// No hay sesión con ese par y hay lugar: se admite.
+    Admit,
+    /// Ya hay una sesión con ese par: se reemplaza (y hay que **terminar la
+    /// vieja**, o quedaría colgada). El reemplazo no cuenta contra el tope: no
+    /// suma una sesión, cambia la que hay.
+    Replace,
+    /// No hay sesión con ese par y no hay lugar: se rechaza.
+    Reject,
+}
+
+/// Decide si una conexión nueva se admite, reemplaza a la que hay o se rechaza.
+///
+/// La clave para no dejar colgar tareas: un par que reconecta con el mismo
+/// certificado cae en `Replace`, no en una entrada nueva —así el mapa no crece—,
+/// pero el reemplazo obliga a terminar la sesión vieja. Y una conexión de un par
+/// distinto sólo entra si no se pasó el tope.
+pub fn admit_session(slot_occupied: bool, current_count: usize, max: usize) -> SessionAdmission {
+    if slot_occupied {
+        SessionAdmission::Replace
+    } else if accept_new_session(current_count, max) {
+        SessionAdmission::Admit
+    } else {
+        SessionAdmission::Reject
+    }
+}
+
+/// Si la entrada que hay para un par en el mapa de sesiones es la de **esta**
+/// sesión, comparando el id único de sesión.
+///
+/// Lo usa la limpieza al cerrar: si entró una sesión de reemplazo, la vieja no
+/// debe borrar del mapa la entrada de la nueva. Sólo borra si sigue siendo la
+/// suya.
+pub fn owns_session_slot(current: Option<u64>, mine: u64) -> bool {
+    current == Some(mine)
+}
+
+/// Recalcula localmente el código de verificación de un pareo **entrante** y lo
+/// compara con el que mandó el par.
+///
+/// El pinning es TOFU (se confía la primera vez), así que este código es la única
+/// defensa humana contra un intermediario en el primer pareo: tiene que salir de
+/// las dos huellas que vemos nosotros, no del dato que manda el par —si no, un
+/// intermediario podría hacer coincidir las dos pantallas—. Devuelve el código
+/// local a mostrar si coincide con el declarado, o `None` si no, en cuyo caso el
+/// pareo se ignora.
+pub fn checked_incoming_code(
+    own_fingerprint: &str,
+    peer_fingerprint: &str,
+    claimed: &str,
+) -> Option<String> {
+    let local = verification_code(own_fingerprint, peer_fingerprint);
+    (local == claimed).then_some(local)
+}
+
 // ── Anuncio mDNS: registro TXT ───────────────────────────────────────────────
 
 /// El registro TXT con el que nos anunciamos, como pares clave/valor listos para
