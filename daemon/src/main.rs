@@ -15,6 +15,7 @@
 //! the windows, the list of known devices — belongs to the logged-in user.
 
 mod adb;
+mod channel;
 mod hotplug;
 mod notify;
 mod permiso;
@@ -83,6 +84,9 @@ struct State {
     /// At most one stream: a V4L2 device takes a single producer.
     webcam: WebcamBridge,
     registry: Registry,
+    /// El estado del canal de red teléfono↔escritorio. `None` hasta que arranca
+    /// (o si no pudo: sin identidad TLS, el resto del servicio sigue andando).
+    channel: Option<channel::ChannelRuntime>,
 }
 
 impl State {
@@ -240,6 +244,90 @@ impl ConnectService {
             state.registry.save();
         }
         removed
+    }
+
+    // ── Canal de red teléfono↔escritorio ─────────────────────────────────────
+    //
+    // Estos métodos deciden con quién se parea y a quién se trata como de
+    // confianza. Como todo lo de este servicio, corren en el bus de **sesión**,
+    // como la persona conectada: cualquier proceso de esa sesión puede llamarlos.
+    // El pareo sólo se confirma desde `confirm_pairing` (la persona local), pero
+    // una llamada a `confirm_pairing` vale tanto como el aislamiento del bus de
+    // sesión —otro proceso de la misma sesión podría hacerla—. Esa frontera la
+    // cierra el confinamiento del proceso (AppArmor), no este servicio; acá no hay
+    // un secreto que un proceso de la sesión no pueda, de todos modos, sacar de
+    // otra forma.
+
+    /// Los pares del canal que el servicio ve ahora: descubiertos por mDNS,
+    /// conectados o pareados. Una fila por par: `device_id`, nombre, categoría,
+    /// huella del certificado, si está pareado y si está conectado.
+    async fn list_peers(&self) -> Vec<(String, String, String, String, bool, bool)> {
+        let state = self.state.lock().await;
+        let Some(ch) = state.channel.as_ref() else {
+            return Vec::new();
+        };
+        ch.peer_rows(&state.registry)
+            .into_iter()
+            .map(|row| {
+                (
+                    row.device_id,
+                    row.name,
+                    row.kind,
+                    row.fingerprint,
+                    row.paired,
+                    row.connected,
+                )
+            })
+            .collect()
+    }
+
+    /// Los pares pareados, estén o no conectados ahora. Es lo que la pantalla de
+    /// ajustes necesita para poder desparear uno que no está presente.
+    async fn list_paired_peers(&self) -> Vec<(String, String, String)> {
+        let state = self.state.lock().await;
+        state
+            .registry
+            .paired_peers()
+            .map(|(device_id, known)| {
+                (
+                    device_id.clone(),
+                    known.display_name().to_owned(),
+                    known.fingerprint.clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// Pide parear con un par descubierto. Abre la conexión y le manda el pedido;
+    /// las dos pantallas muestran el mismo código. Devuelve si se conocía la
+    /// dirección del par para intentarlo.
+    async fn request_pairing(&self, device_id: &str) -> bool {
+        let state = self.state.lock().await;
+        match state.channel.as_ref() {
+            Some(ch) => ch.request_pairing(device_id),
+            None => false,
+        }
+    }
+
+    /// Confirma o rechaza un pedido de pareo entrante. Al confirmar se fija la
+    /// huella del par y queda de confianza; al rechazar se cierra la sesión.
+    async fn confirm_pairing(
+        &self,
+        #[zbus(connection)] connection: &zbus::Connection,
+        device_id: &str,
+        accept: bool,
+    ) -> bool {
+        channel::confirm_pairing(&self.state, connection, device_id, accept).await
+    }
+
+    /// Deshace el pareo de un par: borra su huella fijada y, si está conectado, le
+    /// avisa y cierra la sesión.
+    async fn unpair_peer(
+        &self,
+        #[zbus(connection)] connection: &zbus::Connection,
+        device_id: &str,
+    ) -> bool {
+        channel::unpair_peer(&self.state, connection, device_id).await
     }
 
     /// The cameras on a device.
@@ -401,9 +489,25 @@ impl ConnectService {
     /// the bug this prevents.
     #[zbus(signal)]
     async fn webcam_changed(emitter: &SignalEmitter<'_>, state: WebcamState) -> zbus::Result<()>;
+
+    /// Cambió el conjunto de pares del canal: alguno apareció, se conectó, se
+    /// pareó o se fue. El panel y la pantalla de ajustes repintan la lista con
+    /// [`ConnectService::list_peers`].
+    #[zbus(signal)]
+    async fn peers_changed(emitter: &SignalEmitter<'_>) -> zbus::Result<()>;
+
+    /// Un par pide parear. Trae el código de verificación que las dos pantallas
+    /// muestran; la persona confirma con [`ConnectService::confirm_pairing`].
+    #[zbus(signal)]
+    async fn pairing_requested(
+        emitter: &SignalEmitter<'_>,
+        device_id: &str,
+        name: &str,
+        verification: &str,
+    ) -> zbus::Result<()>;
 }
 
-fn now_iso8601() -> String {
+pub(crate) fn now_iso8601() -> String {
     // Seconds since the epoch, formatted by hand. Pulling in a date library to
     // stamp one field in a config file is not worth the dependency.
     let secs = SystemTime::now()
@@ -595,6 +699,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         windows: WindowManager::default(),
         webcam: WebcamBridge::default(),
         registry: Registry::load(),
+        channel: None,
     }));
 
     let connection = connection::Builder::session()?
@@ -610,6 +715,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let emitter = SignalEmitter::new(&connection, SERVICE_PATH)?;
     info!("servicio en {SERVICE_NAME}");
+
+    // El canal de red teléfono↔escritorio corre junto a adb/scrcpy/cámara,
+    // compartiendo el mismo `State` tras el candado. Si no puede arrancar (sin
+    // identidad TLS), se registra y el resto del servicio sigue andando.
+    tokio::spawn(channel::run(connection.clone(), state.clone()));
 
     // A phone plugged in before the service started produces no udev event, so
     // the first look has to be explicit. The adb server is only started if

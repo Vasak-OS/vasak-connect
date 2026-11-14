@@ -24,6 +24,26 @@ libc = "0.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# ── Canal de red teléfono↔escritorio ─────────────────────────────────────────
+# La identidad TLS: certificado autofirmado (rcgen) y su huella (sha2).
+rcgen = "0.14"
+sha2 = "0.10"
+# TLS mutuo con el proveedor `ring`, no el de por omisión (`aws-lc-rs`): ring no
+# pide `cmake` para compilar y alcanza para lo que el canal usa. Se elige el
+# proveedor a mano en el código, así que no hace falta instalar uno global.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+rustls-pki-types = "1"
+# Descubrimiento DNS-SD. Trae su propio hilo y entrega los eventos por un canal.
+mdns-sd = "0.13"
+# Cliente del Secret Service estándar, para guardar la clave privada del
+# certificado. 0.6 es la última serie sobre zbus 5 (la 0.7 salta a zbus 6, que
+# metería un segundo major de zbus en el binario); con las features por omisión
+# usa criptografía en Rust puro para la sesión cifrada con el llavero.
+oo7 = "0.6"
+# Borra de la memoria las copias intermedias de la clave privada tras usarlas.
+zeroize = "1"
+
 [dev-dependencies]
 # Pruebas de propiedad sobre lo que devuelven `adb` y `scrcpy`. Es lo único de
 # este servicio que interpreta texto que viene de un aparato ajeno: el nombre

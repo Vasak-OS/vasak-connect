@@ -33,6 +33,12 @@ pub struct KnownDevice {
     /// Packages the person pinned to the menu.
     #[serde(default)]
     pub favourites: Vec<String>,
+    /// La huella del certificado TLS fijada al parear este aparato por el canal
+    /// de red (módulo `channel`). Vacía en las entradas de adb, que parean por
+    /// otro mecanismo: es lo único que decide si un par de red es de confianza, y
+    /// se guarda sólo la huella pública, nunca un secreto del par.
+    #[serde(default)]
+    pub fingerprint: String,
 }
 
 impl KnownDevice {
@@ -57,6 +63,13 @@ impl KnownDevice {
 pub struct Registry {
     #[serde(default)]
     devices: BTreeMap<String, KnownDevice>,
+    /// Los pares de red pareados por el canal, por `device_id` (derivado del
+    /// certificado), separados de `devices` —que es de adb y va por serial— para
+    /// que las dos identidades no se mezclen: un teléfono por USB y el mismo por
+    /// la red tienen identificadores distintos, y la pantalla de ajustes de adb
+    /// no debe listar los pares de red ni al revés.
+    #[serde(default)]
+    peers: BTreeMap<String, KnownDevice>,
 }
 
 impl Registry {
@@ -170,6 +183,48 @@ impl Registry {
             None => false,
         }
     }
+
+    // ── Pares de red (canal) ─────────────────────────────────────────────────
+    //
+    // Keyed by `device_id`, no por serial: estos aparatos nunca anuncian un
+    // serial de adb, y su confianza la decide la huella del certificado, no el
+    // mecanismo de adb.
+
+    /// Fija (o refresca) un par como pareado, guardando la huella de su
+    /// certificado. Un par con huella es un par de confianza; olvidarlo la borra.
+    pub fn pin_peer(&mut self, device_id: &str, name: &str, fingerprint: &str, now: &str) {
+        let entry = self
+            .peers
+            .entry(device_id.to_string())
+            .or_insert_with(|| KnownDevice {
+                first_seen: now.to_string(),
+                ..Default::default()
+            });
+        if !name.is_empty() {
+            entry.model = name.to_string();
+        }
+        entry.fingerprint = fingerprint.to_string();
+    }
+
+    /// La huella fijada de un par, si está pareado.
+    pub fn peer_fingerprint(&self, device_id: &str) -> Option<&str> {
+        self.peers
+            .get(device_id)
+            .map(|peer| peer.fingerprint.as_str())
+            .filter(|fingerprint| !fingerprint.is_empty())
+    }
+
+    /// Olvida un par pareado. Devuelve si había algo que olvidar.
+    pub fn unpin_peer(&mut self, device_id: &str) -> bool {
+        self.peers.remove(device_id).is_some()
+    }
+
+    /// Todos los pares de red pareados, para la pantalla de ajustes.
+    pub fn paired_peers(&self) -> impl Iterator<Item = (&String, &KnownDevice)> {
+        self.peers
+            .iter()
+            .filter(|(_, peer)| !peer.fingerprint.is_empty())
+    }
 }
 
 #[cfg(test)]
@@ -263,5 +318,60 @@ mod tests {
             );
         }
         assert_eq!(Registry::path_under(None), None);
+    }
+
+    #[test]
+    fn un_par_fijado_se_lee_y_se_lista() {
+        let mut registry = Registry::default();
+        registry.pin_peer("dev1", "Pixel 8", "AA:BB", "t1");
+        assert_eq!(registry.peer_fingerprint("dev1"), Some("AA:BB"));
+        assert_eq!(registry.peer_fingerprint("otro"), None);
+        let listed: Vec<_> = registry.paired_peers().collect();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].0, "dev1");
+        assert_eq!(listed[0].1.model, "Pixel 8");
+        assert_eq!(listed[0].1.first_seen, "t1");
+    }
+
+    #[test]
+    fn volver_a_fijar_refresca_la_huella_y_conserva_la_primera_vez() {
+        let mut registry = Registry::default();
+        registry.pin_peer("dev1", "Pixel 8", "AA:BB", "t1");
+        registry.pin_peer("dev1", "", "CC:DD", "t2");
+        assert_eq!(registry.peer_fingerprint("dev1"), Some("CC:DD"));
+        let (_, peer) = registry.paired_peers().next().unwrap();
+        assert_eq!(peer.model, "Pixel 8");
+        assert_eq!(peer.first_seen, "t1");
+    }
+
+    #[test]
+    fn olvidar_un_par_borra_su_huella() {
+        let mut registry = Registry::default();
+        registry.pin_peer("dev1", "Pixel 8", "AA:BB", "t1");
+        assert!(registry.unpin_peer("dev1"));
+        assert!(!registry.unpin_peer("dev1"));
+        assert_eq!(registry.peer_fingerprint("dev1"), None);
+        assert_eq!(registry.paired_peers().count(), 0);
+    }
+
+    #[test]
+    fn una_huella_vacia_no_cuenta_como_pareado() {
+        let mut registry = Registry::default();
+        registry.pin_peer("dev1", "Pixel 8", "", "t1");
+        assert_eq!(registry.peer_fingerprint("dev1"), None);
+        assert_eq!(registry.paired_peers().count(), 0);
+    }
+
+    #[test]
+    fn los_pares_de_red_no_se_mezclan_con_los_de_adb() {
+        let mut registry = Registry::default();
+        registry.remember("SERIAL1", "motorola edge 40", "", "t1");
+        registry.pin_peer("dev1", "Pixel 8", "AA:BB", "t2");
+        assert!(!registry.is_known("dev1"));
+        assert_eq!(registry.peer_fingerprint("SERIAL1"), None);
+        assert_eq!(registry.all().count(), 1);
+        assert_eq!(registry.paired_peers().count(), 1);
+        assert!(!registry.forget("dev1"));
+        assert!(registry.is_known("SERIAL1"));
     }
 }
