@@ -176,3 +176,42 @@ pub async fn load_or_create() -> Result<Identity, IdentityError> {
 
     Ok(Identity::from_parts(cert_der, key_der))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn la_identidad_generada_deriva_huella_e_id_del_certificado() {
+        let (cert, key) = generate().unwrap();
+        let identity = Identity::from_parts(cert.clone(), key);
+        assert_eq!(identity.fingerprint, fingerprint_from_der(&cert));
+        assert_eq!(
+            identity.device_id,
+            device_id_from_fingerprint(&identity.fingerprint)
+        );
+        assert_eq!(identity.cert_der.as_ref(), cert.as_slice());
+        assert!(matches!(identity.key_der, PrivateKeyDer::Pkcs8(_)));
+    }
+
+    #[test]
+    fn dos_identidades_generadas_no_comparten_huella() {
+        let (a, _) = generate().unwrap();
+        let (b, _) = generate().unwrap();
+        assert_ne!(fingerprint_from_der(&a), fingerprint_from_der(&b));
+    }
+
+    #[test]
+    fn los_atributos_del_llavero_son_los_de_vasak_connect() {
+        let attrs = secret_attributes();
+        assert_eq!(attrs["application"], "vasak-connect");
+        assert_eq!(attrs["type"], "tls-identity");
+    }
+
+    #[test]
+    fn los_errores_de_identidad_se_explican() {
+        assert!(IdentityError::NoConfigDir.to_string().contains("HOME"));
+        let io = std::io::Error::other("boom");
+        assert!(IdentityError::CertFile(io).to_string().contains("boom"));
+    }
+}

@@ -696,4 +696,159 @@ mod tests {
         assert_eq!(self_name(Some("")), "VasakOS");
         assert_eq!(self_name(None), "VasakOS");
     }
+
+    fn pending_out() -> PairingState {
+        PairingState::OutgoingPending {
+            code: "123456".into(),
+            peer_accepted: false,
+        }
+    }
+
+    fn pending_in() -> PairingState {
+        PairingState::IncomingPending {
+            code: "123456".into(),
+        }
+    }
+
+    #[test]
+    fn un_pair_response_no_pedido_no_fija_a_nadie() {
+        // El bug crítico: sin un pedido saliente pendiente, un `accepted: true`
+        // del par no puede volver a ese par de confianza.
+        let action = advance_pairing(
+            &PairingState::Idle,
+            PairingEvent::PeerResponse { accepted: true },
+        );
+        assert!(!action.pin);
+        assert_eq!(action.next, PairingState::Idle);
+        assert_eq!(action.send, None);
+        assert_eq!(action.notify_code, None);
+    }
+
+    #[test]
+    fn iniciar_el_pareo_manda_el_pedido_y_muestra_el_codigo_sin_fijar() {
+        let action = advance_pairing(
+            &PairingState::Idle,
+            PairingEvent::LocalInitiate { code: "111".into() },
+        );
+        assert!(!action.pin);
+        assert_eq!(
+            action.next,
+            PairingState::OutgoingPending {
+                code: "111".into(),
+                peer_accepted: false
+            }
+        );
+        assert_eq!(
+            action.send,
+            Some(Message::PairRequest {
+                verification: "111".into()
+            })
+        );
+        assert_eq!(action.notify_code.as_deref(), Some("111"));
+    }
+
+    #[test]
+    fn un_pedido_del_par_muestra_el_codigo_y_espera_sin_fijar() {
+        let action = advance_pairing(
+            &PairingState::Idle,
+            PairingEvent::PeerRequest { code: "222".into() },
+        );
+        assert!(!action.pin);
+        assert_eq!(
+            action.next,
+            PairingState::IncomingPending { code: "222".into() }
+        );
+        assert_eq!(action.notify_code.as_deref(), Some("222"));
+        assert_eq!(action.send, None);
+    }
+
+    #[test]
+    fn el_par_que_acepta_nuestro_pedido_se_anota_pero_no_se_fija() {
+        let action = advance_pairing(
+            &pending_out(),
+            PairingEvent::PeerResponse { accepted: true },
+        );
+        assert!(!action.pin);
+        assert_eq!(
+            action.next,
+            PairingState::OutgoingPending {
+                code: "123456".into(),
+                peer_accepted: true
+            }
+        );
+        assert_eq!(action.notify_code.as_deref(), Some("123456"));
+    }
+
+    #[test]
+    fn confirmar_un_pedido_saliente_fija_al_par() {
+        let action = advance_pairing(&pending_out(), PairingEvent::LocalConfirm { accept: true });
+        assert!(action.pin);
+        assert_eq!(action.next, PairingState::Idle);
+    }
+
+    #[test]
+    fn confirmar_un_pedido_entrante_fija_y_contesta_que_si() {
+        let action = advance_pairing(&pending_in(), PairingEvent::LocalConfirm { accept: true });
+        assert!(action.pin);
+        assert_eq!(action.next, PairingState::Idle);
+        assert_eq!(action.send, Some(Message::PairResponse { accepted: true }));
+    }
+
+    #[test]
+    fn confirmar_sin_nada_pendiente_no_fija() {
+        for accept in [true, false] {
+            let action =
+                advance_pairing(&PairingState::Idle, PairingEvent::LocalConfirm { accept });
+            assert!(!action.pin, "accept={accept}");
+            assert_eq!(action.next, PairingState::Idle);
+            assert_eq!(action.send, None);
+        }
+    }
+
+    #[test]
+    fn los_rechazos_no_fijan_y_vuelven_a_reposo() {
+        let par_rechaza = advance_pairing(
+            &pending_out(),
+            PairingEvent::PeerResponse { accepted: false },
+        );
+        assert!(!par_rechaza.pin);
+        assert_eq!(par_rechaza.next, PairingState::Idle);
+
+        let local_rechaza_saliente =
+            advance_pairing(&pending_out(), PairingEvent::LocalConfirm { accept: false });
+        assert!(!local_rechaza_saliente.pin);
+        assert_eq!(local_rechaza_saliente.next, PairingState::Idle);
+
+        let local_rechaza_entrante =
+            advance_pairing(&pending_in(), PairingEvent::LocalConfirm { accept: false });
+        assert!(!local_rechaza_entrante.pin);
+        assert_eq!(local_rechaza_entrante.next, PairingState::Idle);
+        assert_eq!(
+            local_rechaza_entrante.send,
+            Some(Message::PairResponse { accepted: false })
+        );
+    }
+
+    #[test]
+    fn un_pair_response_con_un_pedido_entrante_no_fija() {
+        let action = advance_pairing(&pending_in(), PairingEvent::PeerResponse { accepted: true });
+        assert!(!action.pin);
+        assert_eq!(action.next, pending_in());
+    }
+
+    #[test]
+    fn solo_se_admiten_sesiones_por_debajo_del_tope() {
+        assert!(accept_new_session(0, 3));
+        assert!(accept_new_session(2, 3));
+        assert!(!accept_new_session(3, 3));
+        assert!(!accept_new_session(4, 3));
+    }
+
+    #[test]
+    fn el_keepalive_se_agota_al_alcanzar_el_maximo() {
+        assert!(!keepalive_exhausted(0, 3));
+        assert!(!keepalive_exhausted(2, 3));
+        assert!(keepalive_exhausted(3, 3));
+        assert!(keepalive_exhausted(4, 3));
+    }
 }
