@@ -12,6 +12,7 @@
 
 use std::sync::Arc;
 
+use bytes::{Buf, BytesMut};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvider};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
@@ -20,6 +21,7 @@ use rustls::{
 };
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_util::codec::Decoder;
 use vasak_connect_protocol::wire::Message;
 
 use super::identity::Identity;
@@ -215,6 +217,45 @@ impl std::fmt::Display for SessionError {
 }
 
 impl std::error::Error for SessionError {}
+
+impl From<std::io::Error> for SessionError {
+    fn from(err: std::io::Error) -> Self {
+        SessionError::Io(err)
+    }
+}
+
+/// Decodificador de marcos para un lector persistente (`FramedRead`), que **sí**
+/// es cancel-safe: los bytes a medio leer quedan en su buffer entre pasadas.
+///
+/// El bucle de la sesión lo usa en vez de [`read_frame`]: `read_frame` encadena
+/// dos `read_exact`, y si un `select!` lo cancela a mitad de un marco (porque
+/// ganó un tick de keepalive o un mensaje de salida), los bytes ya consumidos se
+/// pierden y el marco siguiente se lee corrido —y una sesión válida se cierra por
+/// un error que no ocurrió—. Toda la validación sigue siendo la pura de
+/// [`check_frame_len`]/[`decode_frame`]; acá sólo se mueve el buffer.
+pub struct MessageDecoder;
+
+impl Decoder for MessageDecoder {
+    type Item = Message;
+    type Error = SessionError;
+
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Message>, SessionError> {
+        if src.len() < 4 {
+            return Ok(None);
+        }
+        let header = [src[0], src[1], src[2], src[3]];
+        // El tope se hace valer antes de esperar el cuerpo: un largo enorme se
+        // rechaza sin reservar esa memoria.
+        let len = check_frame_len(frame_len(header)).map_err(SessionError::Frame)?;
+        if src.len() < 4 + len {
+            src.reserve(4 + len - src.len());
+            return Ok(None);
+        }
+        src.advance(4);
+        let body = src.split_to(len);
+        decode_frame(&body).map(Some).map_err(SessionError::Frame)
+    }
+}
 
 /// Lee un marco completo: la cabecera de largo, el chequeo de tamaño y el cuerpo.
 ///

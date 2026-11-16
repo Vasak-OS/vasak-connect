@@ -22,10 +22,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::time::{interval, timeout};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
+use tokio_stream::StreamExt;
+use tokio_util::codec::FramedRead;
 use tracing::{debug, info, warn};
 use vasak_connect_protocol::wire::{DeviceKind, Message, PeerInfo, PROTOCOL_VERSION};
 
@@ -33,10 +34,11 @@ use crate::{notify, State};
 use identity::Identity;
 use pure::{
     admit_session, advance_pairing, checked_incoming_code, device_id_from_fingerprint,
-    evaluate_peer_cert, keepalive_exhausted, owns_session_slot, parse_peer_txt, self_name,
-    verification_code, PairingEvent, PairingState, SessionAdmission, TrustDecision,
+    evaluate_peer_cert, keepalive_exhausted, mdns_instance_label, owns_session_slot,
+    parse_peer_txt, self_name, verification_code, PairingEvent, PairingState, SessionAdmission,
+    TrustDecision,
 };
-use transport::{peer_fingerprint, read_frame, write_frame, SessionError};
+use transport::{peer_fingerprint, read_frame, write_frame, MessageDecoder, SessionError};
 
 /// Numerador de sesiones: le da a cada `handle_session` un id único, para que la
 /// limpieza de una sesión vieja no toque la entrada de una de reemplazo.
@@ -50,19 +52,42 @@ const KEEPALIVE: Duration = Duration::from_secs(30);
 /// sesión que dejó de contestar no debe quedar colgada ocupando memoria.
 const MAX_MISSED_PONGS: u32 = 3;
 
-/// Tope de sesiones abiertas a la vez. Lo abre cualquiera que alcance el puerto,
-/// sin estar pareado, así que tiene un techo para que no se pueda agotar la
-/// memoria del servicio abriendo conexiones sin fin.
+/// Tope de sesiones abiertas a la vez.
 const MAX_CONCURRENT_SESSIONS: usize = 32;
+
+/// Sesiones reservadas para pares de confianza. Un par ya pareado, cuyo
+/// certificado fijado verifica, no debe quedar afuera porque un atacante llenó el
+/// cupo con sesiones sin parear: las sin parear sólo llegan hasta
+/// `MAX_CONCURRENT_SESSIONS - TRUSTED_RESERVE`, y estas quedan para los de
+/// confianza.
+const TRUSTED_RESERVE: usize = 8;
+
+/// Tope de conexiones a la vez, contando las que todavía no completaron el
+/// handshake. Es un techo **antes** de arrancar la tarea de cada conexión, para
+/// que un no autenticado no abra muchas dentro de `HANDSHAKE_TIMEOUT`.
+const MAX_CONCURRENT_CONNECTIONS: usize = 64;
 
 /// Lo que se le da al handshake y al primer `Hello` para completarse. Una
 /// conexión que abre el socket y no habla no debe retener una tarea para siempre.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Plazo de una escritura. Un par que manda pero no lee llena el buffer de envío
+/// y dejaría una escritura colgada para siempre, con la sesión sin atender el
+/// keepalive ni el cierre. Pasado esto, la sesión se da por muerta.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Cuánto puede vivir una sesión sin completar el pareo. Una sesión sin parear que
+/// se queda ocupando lugar se cierra: así no se puede tener el cupo lleno de
+/// sesiones a medio parear para siempre.
+const PAIR_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Lo que un par anunció por mDNS y dónde alcanzarlo.
 pub struct Discovered {
     pub peer: PeerInfo,
     pub address: SocketAddr,
+    /// El nombre completo del servicio mDNS, para poder sacar la entrada cuando el
+    /// par desaparece sin cortar su `device_id` por bytes.
+    pub fullname: String,
 }
 
 /// Lo que se le puede mandar a una sesión en curso desde afuera (desde un método
@@ -145,10 +170,12 @@ impl ChannelRuntime {
         rows.into_values().collect()
     }
 
-    /// Pide parear con un par descubierto. Devuelve si se conocía su dirección
-    /// para intentarlo.
+    /// Pide parear con un par. Vale tanto para uno descubierto (hay que discar)
+    /// como para uno que ya tiene una sesión abierta sin parear (el pareo va por
+    /// esa sesión): si no, un par entrante sin parear no podría iniciar el pareo, y
+    /// uno saliente rechazado no podría reintentar. Devuelve si se conocía el par.
     pub fn request_pairing(&self, device_id: &str) -> bool {
-        if !self.discovered.contains_key(device_id) {
+        if !self.discovered.contains_key(device_id) && !self.sessions.contains_key(device_id) {
             return false;
         }
         self.commands
@@ -281,6 +308,11 @@ pub async fn run(connection: zbus::Connection, state: Arc<Mutex<State>>) {
     let acceptor = TlsAcceptor::from(server_cfg);
     let connector = TlsConnector::from(client_cfg);
 
+    // Techo de conexiones a la vez, incluidas las que todavía no completaron el
+    // handshake. El permiso se toma **antes** de arrancar la tarea y se retiene
+    // mientras dura la conexión, así un no autenticado no puede abrir muchas.
+    let connections = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
+
     info!(port, "canal escuchando");
 
     loop {
@@ -288,16 +320,18 @@ pub async fn run(connection: zbus::Connection, state: Arc<Mutex<State>>) {
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, addr)) => {
+                        let Ok(permit) = connections.clone().try_acquire_owned() else {
+                            debug!(%addr, "tope de conexiones del canal alcanzado: se descarta");
+                            continue;
+                        };
                         debug!(%addr, "conexión entrante al canal");
                         let acceptor = acceptor.clone();
                         let state = state.clone();
                         let connection = connection.clone();
-                        // Residual conocido: cada `accept` arranca una tarea antes de
-                        // chequear el tope de sesiones; la cantidad de tareas en
-                        // pre-sesión (handshake + primer Hello) la acota
-                        // `HANDSHAKE_TIMEOUT`, no un techo propio. Si hiciera falta un
-                        // tope duro de conexiones a la vez, iría un semáforo acá.
                         tokio::spawn(async move {
+                            // El permiso se suelta al terminar la tarea: acota las
+                            // conexiones en vuelo, no sólo las sesiones ya armadas.
+                            let _permit = permit;
                             // El handshake tiene un plazo: una conexión que abre el
                             // socket y no completa el TLS no debe retener la tarea.
                             match timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
@@ -318,17 +352,11 @@ pub async fn run(connection: zbus::Connection, state: Arc<Mutex<State>>) {
             Some(command) = command_rx.recv() => {
                 match command {
                     Command::RequestPairing(device_id) => {
-                        let address = {
-                            let guard = state.lock().await;
-                            guard.channel.as_ref()
-                                .and_then(|ch| ch.discovered.get(&device_id))
-                                .map(|d| d.address)
-                        };
-                        let Some(address) = address else { continue };
-
-                        // Si ya hay una sesión abierta con ese par, el pareo va
-                        // por ella (por la máquina de pareo, no mandando a mano);
-                        // sólo se abre una nueva si no la hay.
+                        // Si ya hay una sesión abierta con ese par, el pareo va por
+                        // ella (por la máquina de pareo, no mandando a mano). Se mira
+                        // **antes** que la dirección descubierta: un par conectado se
+                        // saca de `discovered`, así que si no se mirara primero no se
+                        // podría parear a través de una sesión ya abierta.
                         let session_peer = {
                             let guard = state.lock().await;
                             guard.channel.as_ref()
@@ -348,10 +376,25 @@ pub async fn run(connection: zbus::Connection, state: Arc<Mutex<State>>) {
                             continue;
                         }
 
+                        // Si no hay sesión, hace falta la dirección descubierta para
+                        // discar.
+                        let address = {
+                            let guard = state.lock().await;
+                            guard.channel.as_ref()
+                                .and_then(|ch| ch.discovered.get(&device_id))
+                                .map(|d| d.address)
+                        };
+                        let Some(address) = address else { continue };
+                        let Ok(permit) = connections.clone().try_acquire_owned() else {
+                            debug!(%device_id, "tope de conexiones alcanzado: no se puede discar ahora");
+                            continue;
+                        };
+
                         let connector = connector.clone();
                         let state = state.clone();
                         let connection = connection.clone();
                         tokio::spawn(async move {
+                            let _permit = permit;
                             if let Err(err) = dial_and_pair(connector, address, state, connection).await {
                                 debug!(%err, %address, "no se pudo parear con el par");
                             }
@@ -364,17 +407,27 @@ pub async fn run(connection: zbus::Connection, state: Arc<Mutex<State>>) {
 }
 
 /// Se conecta a un par y corre la sesión pidiendo pareo.
+///
+/// El connect TCP y el handshake TLS tienen un plazo: un par descubierto que
+/// acepta el TCP pero nunca completa el TLS, de otro modo, dejaría esta tarea
+/// colgada para siempre —y `unpair_peer` no la podría cerrar porque todavía no
+/// hay sesión—. El plazo cubre sólo el armado; la sesión activa posterior tiene
+/// sus propios cierres (keepalive, cierre de escritura).
 async fn dial_and_pair(
     connector: TlsConnector,
     address: SocketAddr,
     state: Arc<Mutex<State>>,
     connection: zbus::Connection,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let tcp = TcpStream::connect(address).await?;
     // El nombre del servidor en el TLS no se valida (no hay CA, se fija la
     // huella), pero rustls pide uno bien formado.
     let server_name = rustls_pki_types::ServerName::try_from("vasak-connect")?.to_owned();
-    let tls = connector.connect(server_name, tcp).await?;
+    let tls = timeout(HANDSHAKE_TIMEOUT, async {
+        let tcp = TcpStream::connect(address).await?;
+        connector.connect(server_name, tcp).await
+    })
+    .await
+    .map_err(|_| "el par no completó la conexión a tiempo")??;
     let (_, client_conn) = tls.get_ref();
     let fingerprint = peer_fingerprint(client_conn.peer_certificates());
     handle_session(tls, fingerprint, true, state, connection).await;
@@ -411,8 +464,11 @@ async fn handle_session<S>(
         own_peer_info(&ch.identity, &ch.name)
     };
 
-    if let Err(err) = write_frame(&mut writer, &Message::Hello(own.clone())).await {
-        debug!(%err, "no se pudo enviar el Hello");
+    if send_with_deadline(&mut writer, &Message::Hello(own.clone()))
+        .await
+        .is_err()
+    {
+        debug!("no se pudo enviar el Hello");
         return;
     }
 
@@ -463,6 +519,15 @@ async fn handle_session<S>(
     // de memoria; un par que reconecta con el mismo certificado **reemplaza** su
     // sesión en vez de sumar una, y para que eso acote de verdad hay que terminar
     // la sesión vieja —si no, su tarea queda colgada hasta agotar el keepalive—.
+    //
+    // Las sesiones sin parear sólo llegan hasta `MAX - TRUSTED_RESERVE`: así un
+    // atacante no puede llenar el cupo con sesiones sin parear y dejar afuera a un
+    // par de confianza, que sí puede usar hasta `MAX`.
+    let effective_max = if paired {
+        MAX_CONCURRENT_SESSIONS
+    } else {
+        MAX_CONCURRENT_SESSIONS - TRUSTED_RESERVE
+    };
     let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Outbound>();
     {
@@ -473,7 +538,7 @@ async fn handle_session<S>(
         match admit_session(
             ch.sessions.contains_key(&device_id),
             ch.sessions.len(),
-            MAX_CONCURRENT_SESSIONS,
+            effective_max,
         ) {
             SessionAdmission::Reject => {
                 warn!(%device_id, "se alcanzó el tope de sesiones del canal: se rechaza");
@@ -526,29 +591,40 @@ async fn handle_session<S>(
         }
     }
 
+    // El bucle lee con un `FramedRead`: es cancel-safe, así que un `select!` que
+    // gana con otro brazo a mitad de un marco no pierde los bytes ya leídos
+    // —cosa que `read_frame` (dos `read_exact`) sí haría, corrompiendo el flujo—.
+    let mut frames = FramedRead::new(reader, MessageDecoder);
+
     let mut keepalive = interval(KEEPALIVE);
     keepalive.tick().await; // el primer tick es inmediato; lo descartamos
     let mut missed_pongs: u32 = 0;
 
+    // Plazo para completar el pareo: una sesión que se queda sin parear ocupando
+    // lugar se cierra. Una vez pareada, el plazo se corre muy lejos y no vuelve a
+    // disparar.
+    let pair_deadline = tokio::time::sleep(PAIR_TIMEOUT);
+    tokio::pin!(pair_deadline);
+
     loop {
         tokio::select! {
-            incoming = read_frame(&mut reader) => {
+            incoming = frames.next() => {
                 match incoming {
                     // El `Pong` es la respuesta al keepalive: pone a cero la cuenta
                     // de los que faltan. Se mira acá, en el bucle, porque la cuenta
                     // vive acá.
-                    Ok(Message::Pong) => { missed_pongs = 0; }
-                    Ok(message) => {
+                    Some(Ok(Message::Pong)) => { missed_pongs = 0; }
+                    Some(Ok(message)) => {
                         if !handle_message(message, &device_id, &peer, &own.fingerprint, &fingerprint, &mut writer, &state, &connection).await {
                             break;
                         }
                     }
-                    Err(SessionError::Closed) => {
-                        debug!(%device_id, "el par cerró la sesión");
+                    Some(Err(err)) => {
+                        debug!(%device_id, %err, "error de sesión: se cierra");
                         break;
                     }
-                    Err(err) => {
-                        debug!(%device_id, %err, "error de sesión: se cierra");
+                    None => {
+                        debug!(%device_id, "el par cerró la sesión");
                         break;
                     }
                 }
@@ -557,7 +633,7 @@ async fn handle_session<S>(
             Some(out) = out_rx.recv() => {
                 match out {
                     Outbound::Send(message) => {
-                        if write_frame(&mut writer, &message).await.is_err() {
+                        if send_with_deadline(&mut writer, &message).await.is_err() {
                             break;
                         }
                     }
@@ -572,10 +648,27 @@ async fn handle_session<S>(
                     debug!(%device_id, "el par dejó de contestar el keepalive: se cierra");
                     break;
                 }
-                if write_frame(&mut writer, &Message::Ping).await.is_err() {
+                if send_with_deadline(&mut writer, &Message::Ping).await.is_err() {
                     break;
                 }
                 missed_pongs += 1;
+            }
+
+            _ = &mut pair_deadline => {
+                // Se cierra si todavía no completó el pareo; si ya está pareada, el
+                // plazo se desactiva corriéndolo muy lejos.
+                let still_unpaired = {
+                    let guard = state.lock().await;
+                    guard.channel.as_ref()
+                        .and_then(|ch| ch.sessions.get(&device_id))
+                        .map(|s| !s.paired)
+                        .unwrap_or(true)
+                };
+                if still_unpaired {
+                    debug!(%device_id, "la sesión no completó el pareo a tiempo: se cierra");
+                    break;
+                }
+                pair_deadline.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(86_400));
             }
         }
     }
@@ -595,6 +688,23 @@ async fn handle_session<S>(
     }
     emit_peer_changed(&connection).await;
     info!(%device_id, "sesión del canal cerrada");
+}
+
+/// Escribe un marco con un plazo. Un par que manda pero no lee llena el buffer de
+/// envío y, sin plazo, dejaría esta escritura colgada para siempre, con la sesión
+/// sin atender el keepalive ni el `Shutdown` del reemplazo —y su tarea y su socket
+/// vivos fuera del mapa—. Pasado el plazo, se trata como error y la sesión cierra.
+async fn send_with_deadline<W>(writer: &mut W, message: &Message) -> Result<(), SessionError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    match timeout(WRITE_TIMEOUT, write_frame(writer, message)).await {
+        Ok(result) => result,
+        Err(_) => Err(SessionError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "la escritura no se completó a tiempo",
+        ))),
+    }
 }
 
 /// Procesa un mensaje entrante. Devuelve `false` si la sesión debe cerrarse.
@@ -619,7 +729,7 @@ where
     W: tokio::io::AsyncWrite + Unpin,
 {
     match message {
-        Message::Ping => write_frame(writer, &Message::Pong).await.is_ok(),
+        Message::Ping => send_with_deadline(writer, &Message::Pong).await.is_ok(),
         // El `Pong` lo mira el bucle de la sesión (pone a cero el keepalive); si
         // llega acá, no hay nada que hacer.
         Message::Pong => true,
@@ -689,8 +799,11 @@ where
         Message::Unpair => {
             {
                 let mut guard = state.lock().await;
+                // El par nos deshizo el pareo. Si no se guarda, al reiniciar lo
+                // seguiríamos teniendo como de confianza, pero él ya nos olvidó y no
+                // se va a conectar como pareado: best-effort y se registra.
                 if guard.registry.unpin_peer(device_id) {
-                    guard.registry.save();
+                    guard.registry.save_or_log();
                 }
                 if let Some(ch) = guard.channel.as_mut() {
                     if let Some(session) = ch.sessions.get_mut(device_id) {
@@ -744,7 +857,7 @@ async fn apply_pairing_over_writer<W>(
     W: tokio::io::AsyncWrite + Unpin,
 {
     if let Some(message) = &action.send {
-        let _ = write_frame(writer, message).await;
+        let _ = send_with_deadline(writer, message).await;
     }
     if let Some(code) = &action.notify_code {
         emit_pairing_requested(connection, device_id, peer_name, code).await;
@@ -790,7 +903,10 @@ async fn pin_peer(state: &Arc<Mutex<State>>, device_id: &str, name: &str, finger
     let mut guard = state.lock().await;
     let now = crate::now_iso8601();
     guard.registry.pin_peer(device_id, name, fingerprint, &now);
-    guard.registry.save();
+    // Si no se guarda, en memoria el par queda pareado para esta sesión; al
+    // reiniciar habría que reparear, que falla seguro (no deja entrar a nadie de
+    // más). Por eso es best-effort, a diferencia del desapareo.
+    guard.registry.save_or_log();
     if let Some(ch) = guard.channel.as_mut() {
         if let Some(session) = ch.sessions.get_mut(device_id) {
             session.paired = true;
@@ -820,14 +936,22 @@ fn spawn_discovery(
             }
         };
 
-        // Etiqueta de instancia: el id es de 64 hex y una etiqueta DNS-SD no
-        // pasa de 63 octetos, así que se recorta; la identidad completa va en el
-        // TXT igual.
-        let instance = &device_id[..device_id.len().min(40)];
+        // Se anuncia y se escucha sólo por IPv4, para que lo anunciado y lo que se
+        // escucha coincidan: el listener está en `0.0.0.0` (IPv4), y `enable_addr_auto`
+        // anunciaría también las IPv6 de un host dual-stack —que el par podría
+        // elegir y no poder conectar—.
+        if let Err(err) = daemon.disable_interface(mdns_sd::IfKind::IPv6) {
+            warn!(%err, "no se pudo limitar mDNS a IPv4");
+        }
+
+        // Etiqueta de instancia: el id es de 64 hex y una etiqueta DNS-SD no pasa
+        // de 63 octetos, así que se recorta **por caracteres** (ver
+        // `mdns_instance_label`); la identidad completa va en el TXT igual.
+        let instance = mdns_instance_label(&device_id);
         let host = format!("{instance}.local.");
         let properties: Vec<(String, String)> = pure::build_txt(&own);
 
-        match mdns_sd::ServiceInfo::new(SERVICE_TYPE, instance, &host, "", port, &properties[..]) {
+        match mdns_sd::ServiceInfo::new(SERVICE_TYPE, &instance, &host, "", port, &properties[..]) {
             Ok(info) => {
                 let info = info.enable_addr_auto();
                 if let Err(err) = daemon.register(info) {
@@ -873,9 +997,17 @@ async fn handle_resolved(
         .map(|prop| (prop.key().to_string(), prop.val_str().to_string()))
         .collect();
 
-    let Some(peer) = parse_peer_txt(&properties) else {
+    let Some(mut peer) = parse_peer_txt(&properties) else {
         return;
     };
+    // El id con el que se recuerda al par se **deriva de la huella anunciada**, no
+    // se usa el `device_id` que el par puso en el TXT: así coincide con el id
+    // derivado del certificado que usa `handle_session` (para un par honesto, que
+    // anuncia su huella de verdad), y no aparece el mismo aparato dos veces ni se
+    // pierde el pedido de pareo por el id anunciado. La confianza la sigue
+    // decidiendo el certificado del TLS, no el TXT.
+    peer.device_id = device_id_from_fingerprint(&peer.fingerprint);
+
     // No descubrirse a sí mismo.
     if peer.device_id == own_device_id {
         return;
@@ -888,6 +1020,7 @@ async fn handle_resolved(
     else {
         return;
     };
+    let fullname = info.get_fullname().to_string();
 
     {
         let mut guard = state.lock().await;
@@ -897,26 +1030,32 @@ async fn handle_resolved(
             if ch.sessions.contains_key(&peer.device_id) {
                 return;
             }
-            ch.discovered
-                .insert(peer.device_id.clone(), Discovered { peer, address });
+            ch.discovered.insert(
+                peer.device_id.clone(),
+                Discovered {
+                    peer,
+                    address,
+                    fullname,
+                },
+            );
         }
     }
     emit_peer_changed(connection).await;
 }
 
-/// Un par que desapareció del mDNS: se saca de lo descubierto si no hay sesión.
+/// Un par que desapareció del mDNS: se saca de lo descubierto por su nombre
+/// completo de servicio, que es lo que trae el evento —sin cortar ningún id por
+/// bytes—.
 async fn handle_removed(fullname: &str, state: &Arc<Mutex<State>>, connection: &zbus::Connection) {
-    // El fullname empieza con la etiqueta de instancia, que son los primeros
-    // caracteres del device_id: se busca por prefijo entre lo descubierto.
     let mut changed = false;
     {
         let mut guard = state.lock().await;
         if let Some(ch) = guard.channel.as_mut() {
             let gone: Vec<String> = ch
                 .discovered
-                .keys()
-                .filter(|id| fullname.starts_with(&id[..id.len().min(40)]))
-                .cloned()
+                .iter()
+                .filter(|(_, discovered)| discovered.fullname == fullname)
+                .map(|(id, _)| id.clone())
                 .collect();
             for id in gone {
                 ch.discovered.remove(&id);
@@ -979,27 +1118,48 @@ pub async fn confirm_pairing(
 
 /// Deshace el pareo de un par: borra la huella fijada y, si está conectado, le
 /// avisa con `Unpair` y cierra la sesión.
+///
+/// Devuelve `Err` si el cambio **no se pudo guardar**: desparear es un cambio de
+/// confianza, y reportarlo como hecho cuando no llegó al disco deja volver el pin
+/// viejo al reiniciar —y con él un certificado revocado como de confianza—. Si no
+/// se pudo guardar, se restaura el pin en memoria para que el estado vivo no
+/// mienta respecto del disco. `Ok(false)` significa que no había nada que
+/// desparear.
 pub async fn unpair_peer(
     state: &Arc<Mutex<State>>,
     connection: &zbus::Connection,
     device_id: &str,
-) -> bool {
+) -> Result<bool, String> {
     let removed = {
         let mut guard = state.lock().await;
-        let removed = guard.registry.unpin_peer(device_id);
-        if removed {
-            guard.registry.save();
+        // Se copia la entrada antes de tocarla, para poder restaurarla si no se
+        // puede guardar.
+        let Some(previous) = guard.registry.paired_peer(device_id).cloned() else {
+            return Ok(false);
+        };
+        guard.registry.unpin_peer(device_id);
+        if let Err(err) = guard.registry.save() {
+            // No se guardó: el desapareo no es durable, así que se restaura el par
+            // en memoria para que el estado vivo y el disco digan lo mismo, y se
+            // avisa para poder reintentar.
+            guard.registry.pin_peer(
+                device_id,
+                &previous.model,
+                &previous.fingerprint,
+                &crate::now_iso8601(),
+            );
+            return Err(format!("no se pudo guardar el desapareo: {err}"));
         }
         if let Some(ch) = guard.channel.as_ref() {
             ch.send_to(device_id, Message::Unpair);
             ch.shutdown(device_id);
         }
-        removed
+        true
     };
     if removed {
         emit_peer_changed(connection).await;
     }
-    removed
+    Ok(removed)
 }
 
 /// Emite la señal de que cambió el conjunto de pares (descubierto, conectado o

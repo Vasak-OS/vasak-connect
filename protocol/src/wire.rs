@@ -5,8 +5,8 @@
 //! máquina, y por eso usa `zbus`. Esto es otra cosa: viaja por la red, entre
 //! dos aparatos, y lo tiene que entender también la app móvil —que vive en otro
 //! repositorio y no puede depender de `zbus`—. Por eso el módulo es
-//! deliberadamente pobre en dependencias: sólo `serde` y `serde_json`, nada que
-//! no compile en Android o iOS.
+//! deliberadamente pobre en dependencias: `serde`, `serde_json` y `sha2` (para el
+//! código de verificación del pareo), nada que no compile en Android o iOS.
 //!
 //! El modelo copia el de KDE Connect porque está probado: cada aparato tiene
 //! una identidad de larga vida (un certificado autofirmado), el descubrimiento
@@ -15,6 +15,7 @@
 //! certificado; lo de este archivo es sólo la forma de los mensajes.
 
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 
 /// Versión del protocolo de red. Se anuncia en el descubrimiento y se manda en
 /// [`Message::Hello`]; dos puntas con versiones incompatibles se descartan antes
@@ -186,24 +187,36 @@ pub fn decode(bytes: &[u8]) -> Result<Message, serde_json::Error> {
 /// que las dos están fijando los certificados que creen; un intermediario que
 /// cambió un certificado da otro número.
 ///
-/// shortcut: el plegado es un hash propio débil (colisiona), no criptográfico;
-/// pasar a SHA-256 truncado cuando se endurezca el pareo. La seguridad real la
-/// da el pinning del certificado, no este número.
+/// El número de seis dígitos sale de SHA-256 de las dos huellas ordenadas: así
+/// las dos puntas sacan el mismo sin importar quién empezó, y no se puede
+/// precomputar un número a partir de otro con un plegado débil.
+///
+/// shortcut: esto sube la barra pero no es un SAS completo. El código sigue
+/// saliendo de dos huellas públicas de larga vida, así que un intermediario
+/// podría, con esfuerzo, generar certificados offline hasta que las dos pantallas
+/// muestren el mismo número de seis dígitos (colisión de SAS, RFC 6189). El fix
+/// completo es un intercambio con compromiso al estilo RFC 6189 (cada lado se
+/// compromete a su aporte antes de ver el del otro), y va como follow-up: no se
+/// rediseña el pareo en este PR. La seguridad real la sigue dando el pinning del
+/// certificado; este número es la verificación humana contra un intermediario.
 pub fn verification_code(fingerprint_a: &str, fingerprint_b: &str) -> String {
     let (first, second) = if fingerprint_a <= fingerprint_b {
         (fingerprint_a, fingerprint_b)
     } else {
         (fingerprint_b, fingerprint_a)
     };
-    let mut acc: u32 = 2_166_136_261; // base FNV-1a, sólo como semilla del plegado
-    for byte in first
-        .bytes()
-        .chain(b":".iter().copied())
-        .chain(second.bytes())
-    {
-        acc = acc.wrapping_mul(16_777_619) ^ u32::from(byte);
-    }
-    format!("{:06}", acc % 1_000_000)
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(first.as_bytes());
+    hasher.update(b":");
+    hasher.update(second.as_bytes());
+    let digest = hasher.finalize();
+    // Los primeros ocho bytes del hash como número, y los seis dígitos de abajo.
+    // Tomar sólo una parte del hash no debilita nada acá: el espacio de salida son
+    // seis dígitos de todos modos.
+    let mut head = [0u8; 8];
+    head.copy_from_slice(&digest[..8]);
+    let value = u64::from_be_bytes(head) % 1_000_000;
+    format!("{value:06}")
 }
 
 #[cfg(test)]

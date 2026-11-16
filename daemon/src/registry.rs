@@ -114,31 +114,45 @@ impl Registry {
         }
     }
 
-    pub fn save(&self) {
-        let Some(path) = Self::path() else { return };
-        if let Some(parent) = path.parent() {
-            if let Err(err) = std::fs::create_dir_all(parent) {
-                warn!(%err, ?parent, "no se pudo crear el directorio de configuración");
-                return;
-            }
-        }
-        let Ok(text) = serde_json::to_string_pretty(self) else {
-            return;
+    /// Persiste el registro, devolviendo el error si no se pudo.
+    ///
+    /// Es fallable a propósito: un cambio de confianza (desparear un par) que no
+    /// llega al disco pero se reporta como hecho deja volver el pin viejo al
+    /// reiniciar, y con él un certificado revocado como de confianza. Quien hace
+    /// un cambio así tiene que poder enterarse de que no se guardó. Los cambios
+    /// que no son de confianza usan [`Registry::save_or_log`], que sólo registra.
+    pub fn save(&self) -> std::io::Result<()> {
+        let Some(path) = Self::path() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "sin HOME ni XDG_CONFIG_HOME: no hay dónde guardar",
+            ));
         };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let text = serde_json::to_string_pretty(self)?;
 
         // Written through a temporary file: a crash midway through would
         // otherwise leave a truncated file, and the next start would decide
         // that no phone had ever been trusted.
         let tmp = path.with_extension("json.tmp");
-        if let Err(err) = std::fs::write(&tmp, text) {
-            warn!(%err, "no se pudo guardar la lista de dispositivos");
-            return;
-        }
+        std::fs::write(&tmp, text)?;
         if let Err(err) = std::fs::rename(&tmp, &path) {
-            warn!(%err, "no se pudo reemplazar la lista de dispositivos");
             let _ = std::fs::remove_file(&tmp);
+            return Err(err);
         }
         debug!(?path, "lista de dispositivos guardada");
+        Ok(())
+    }
+
+    /// Persiste el registro sin fallar: si no se pudo, lo registra y sigue. Para
+    /// los cambios que no son de confianza (un alias, un dispositivo adb visto por
+    /// primera vez), donde perder la escritura es recuperable y no un agujero.
+    pub fn save_or_log(&self) {
+        if let Err(err) = self.save() {
+            warn!(%err, "no se pudo guardar la lista de dispositivos");
+        }
     }
 
     pub fn is_known(&self, serial: &str) -> bool {
@@ -224,6 +238,14 @@ impl Registry {
         self.peers
             .iter()
             .filter(|(_, peer)| !peer.fingerprint.is_empty())
+    }
+
+    /// La entrada de un par de red pareado, para poder restaurarla si un cambio no
+    /// se pudo guardar.
+    pub fn paired_peer(&self, device_id: &str) -> Option<&KnownDevice> {
+        self.peers
+            .get(device_id)
+            .filter(|peer| !peer.fingerprint.is_empty())
     }
 }
 

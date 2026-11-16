@@ -16,10 +16,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use tracing::debug;
+use tracing::{debug, warn};
 use zeroize::Zeroizing;
 
-use super::pure::{device_id_from_fingerprint, fingerprint_from_der};
+use super::pure::{device_id_from_fingerprint, fingerprint_from_der, identity_pair_matches};
 
 /// Atributos con los que se guarda y se busca la clave en el Secret Service.
 ///
@@ -118,33 +118,51 @@ fn generate() -> Result<(Vec<u8>, Zeroizing<Vec<u8>>), rcgen::Error> {
     Ok((cert_der, key_der))
 }
 
-/// Lee la clave privada del Secret Service, si está.
-async fn load_key() -> Result<Option<Zeroizing<Vec<u8>>>, oo7::Error> {
+/// Nombre del atributo que ata la clave guardada a su certificado: la huella del
+/// certificado que forma par con esta clave. Al cargar se compara con la del
+/// certificado en disco; si no coinciden, son de generaciones distintas.
+const CERT_FINGERPRINT_ATTR: &str = "cert_fp";
+
+/// La clave privada del llavero más la huella del certificado con el que se
+/// guardó, si está.
+async fn load_key() -> Result<Option<(Zeroizing<Vec<u8>>, Option<String>)>, oo7::Error> {
     let keyring = oo7::Keyring::new().await?;
     let items = keyring.search_items(&secret_attributes()).await?;
     match items.first() {
-        // El `Secret` de oo7 ya se borra solo al soltarse; la copia que sacamos se
-        // envuelve en `Zeroizing` para que corra la misma suerte.
-        Some(item) => Ok(Some(Zeroizing::new(item.secret().await?.to_vec()))),
+        Some(item) => {
+            let stored_fp = item.attributes().await?.get(CERT_FINGERPRINT_ATTR).cloned();
+            // El `Secret` de oo7 ya se borra solo al soltarse; la copia que sacamos
+            // se envuelve en `Zeroizing` para que corra la misma suerte.
+            let key = Zeroizing::new(item.secret().await?.to_vec());
+            Ok(Some((key, stored_fp)))
+        }
         None => Ok(None),
     }
 }
 
-/// Guarda (reemplazando) la clave privada en el Secret Service.
-async fn store_key(key_pkcs8_der: &[u8]) -> Result<(), oo7::Error> {
+/// Guarda (reemplazando) la clave privada en el Secret Service, con la huella de
+/// su certificado como atributo, para poder detectar después un par desparejo.
+async fn store_key(key_pkcs8_der: &[u8], cert_fingerprint: &str) -> Result<(), oo7::Error> {
     let keyring = oo7::Keyring::new().await?;
+    let attributes = HashMap::from([
+        ("application", "vasak-connect"),
+        ("type", "tls-identity"),
+        (CERT_FINGERPRINT_ATTR, cert_fingerprint),
+    ]);
     keyring
-        .create_item(SECRET_LABEL, &secret_attributes(), key_pkcs8_der, true)
+        .create_item(SECRET_LABEL, &attributes, key_pkcs8_der, true)
         .await?;
     Ok(())
 }
 
-/// Carga la identidad, o la crea y la guarda si falta.
+/// Carga la identidad, o la crea y la guarda si falta o si quedó desparejo.
 ///
-/// Lee la clave del llavero y el certificado del archivo; si falta cualquiera de
-/// los dos, genera un par nuevo y lo persiste. Se regeneran **juntos** a
-/// propósito: la clave y el certificado tienen que ser el mismo par, así que si
-/// uno se perdió, el otro ya no sirve.
+/// Lee la clave del llavero y el certificado del archivo. Los usa sólo si los dos
+/// están **y son el mismo par** —la huella guardada con la clave coincide con la
+/// del certificado en disco—; si no, genera un par nuevo y lo persiste. Esto
+/// recupera un corte entre guardar la clave y escribir el certificado: ahí la
+/// clave nueva y el certificado viejo no se corresponden, el TLS fallaría siempre,
+/// y sin esta comprobación el próximo arranque los daría por buenos.
 pub async fn load_or_create() -> Result<Identity, IdentityError> {
     let path = cert_path().ok_or(IdentityError::NoConfigDir)?;
 
@@ -155,14 +173,18 @@ pub async fn load_or_create() -> Result<Identity, IdentityError> {
         Err(err) => return Err(IdentityError::CertFile(err)),
     };
 
-    if let (Some(key), Some(cert)) = (key, cert) {
-        debug!("identidad TLS cargada del llavero y del archivo");
-        return Ok(Identity::from_parts(cert, key));
+    if let (Some((key, stored_fp)), Some(cert)) = (key, cert) {
+        if identity_pair_matches(stored_fp.as_deref(), &cert) {
+            debug!("identidad TLS cargada del llavero y del archivo");
+            return Ok(Identity::from_parts(cert, key));
+        }
+        warn!("la clave y el certificado guardados no son el mismo par: se regenera la identidad");
     }
 
-    debug!("sin identidad TLS completa: se genera una nueva");
+    debug!("sin identidad TLS consistente: se genera una nueva");
     let (cert_der, key_der) = generate().map_err(IdentityError::Generate)?;
-    store_key(&key_der[..])
+    let cert_fingerprint = fingerprint_from_der(&cert_der);
+    store_key(&key_der[..], &cert_fingerprint)
         .await
         .map_err(IdentityError::Keyring)?;
     if let Some(parent) = path.parent() {

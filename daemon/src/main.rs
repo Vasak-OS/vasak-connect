@@ -226,7 +226,7 @@ impl ConnectService {
         let mut state = self.state.lock().await;
         let changed = state.registry.set_alias(serial, alias);
         if changed {
-            state.registry.save();
+            state.registry.save_or_log();
         }
         changed
     }
@@ -241,7 +241,7 @@ impl ConnectService {
         let mut state = self.state.lock().await;
         let removed = state.registry.forget(serial);
         if removed {
-            state.registry.save();
+            state.registry.save_or_log();
         }
         removed
     }
@@ -322,12 +322,19 @@ impl ConnectService {
 
     /// Deshace el pareo de un par: borra su huella fijada y, si está conectado, le
     /// avisa y cierra la sesión.
+    ///
+    /// Devuelve error si el cambio no se pudo guardar: desparear es un cambio de
+    /// confianza, y hay que avisarle a quien lo pidió si no quedó en el disco —al
+    /// reiniciar volvería el par viejo— en vez de reportar un éxito falso. `false`
+    /// significa que no había nada que desparear.
     async fn unpair_peer(
         &self,
         #[zbus(connection)] connection: &zbus::Connection,
         device_id: &str,
-    ) -> bool {
-        channel::unpair_peer(&self.state, connection, device_id).await
+    ) -> Result<bool, FdoError> {
+        channel::unpair_peer(&self.state, connection, device_id)
+            .await
+            .map_err(FdoError::Failed)
     }
 
     /// The cameras on a device.
@@ -592,7 +599,7 @@ async fn refresh_devices(
                     .registry
                     .remember(&device.serial, &device.model, &device.address, &now);
                 if first_time {
-                    state.registry.save();
+                    state.registry.save_or_log();
                 }
             }
 

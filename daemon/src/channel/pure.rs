@@ -56,6 +56,21 @@ pub fn fingerprints_equal(a: &str, b: &str) -> bool {
     normalize_fingerprint(a) == normalize_fingerprint(b)
 }
 
+/// Si una clave guardada y un certificado en disco son el **mismo par**,
+/// comparando la huella que se guardó junto a la clave con la del certificado.
+///
+/// Es la defensa contra un corte entre guardar la clave y escribir el
+/// certificado: si quedan de generaciones distintas, sus huellas no coinciden y
+/// el par se regenera entero en vez de arrancar con una clave y un certificado
+/// que no se corresponden —con los que el TLS fallaría siempre—. Sin huella
+/// guardada (`None`) se considera inconsistente, para forzar la regeneración.
+pub fn identity_pair_matches(stored_cert_fingerprint: Option<&str>, cert_der: &[u8]) -> bool {
+    match stored_cert_fingerprint {
+        Some(stored) => fingerprints_equal(stored, &fingerprint_from_der(cert_der)),
+        None => false,
+    }
+}
+
 // ── Enmarcado de la sesión de control ────────────────────────────────────────
 
 /// Tope de un marco, en bytes. Un marco que lo pase se rechaza sin reservar la
@@ -253,6 +268,11 @@ pub enum PairingState {
     /// código, y que el par conteste que acepta. `peer_accepted` dice si el par ya
     /// contestó que sí; aun así no se fija hasta la confirmación local.
     OutgoingPending { code: String, peer_accepted: bool },
+    /// Nosotros pedimos parear, la persona local **ya confirmó** el código, y
+    /// falta la respuesta del par. Se fija recién cuando el par acepta: así, si la
+    /// confirmación local llega antes que el `PairResponse`, un `accepted: false`
+    /// posterior cancela en vez de dejar fijado a un par que rechazó.
+    OutgoingConfirmed { code: String },
     /// El par pidió parear y esperamos la confirmación local.
     IncomingPending { code: String },
 }
@@ -352,13 +372,65 @@ pub fn advance_pairing(state: &PairingState, event: PairingEvent) -> PairingActi
             }
         }
 
-        // La persona confirma un pedido saliente: **acá sí se fija**. No hace
-        // falta avisarle nada más al par: pareó cuando su propia persona aceptó.
-        (PairingState::OutgoingPending { .. }, PairingEvent::LocalConfirm { accept: true }) => {
+        // La persona confirma un pedido saliente **que el par ya aceptó**: los dos
+        // aceptaron, se fija. No hace falta avisarle nada más al par.
+        (
+            PairingState::OutgoingPending {
+                peer_accepted: true,
+                ..
+            },
+            PairingEvent::LocalConfirm { accept: true },
+        ) => PairingAction {
+            next: PairingState::Idle,
+            send: None,
+            pin: true,
+            notify_code: None,
+        },
+
+        // La persona confirma un pedido saliente **antes de que el par conteste**:
+        // se anota la confirmación local y se espera; recién se fija cuando el par
+        // acepte. Si el par rechaza después, se cancela sin haber fijado.
+        (
+            PairingState::OutgoingPending {
+                code,
+                peer_accepted: false,
+            },
+            PairingEvent::LocalConfirm { accept: true },
+        ) => PairingAction {
+            next: PairingState::OutgoingConfirmed { code: code.clone() },
+            send: None,
+            pin: false,
+            notify_code: None,
+        },
+
+        // Ya confirmamos localmente y el par acepta: los dos aceptaron, se fija.
+        (PairingState::OutgoingConfirmed { .. }, PairingEvent::PeerResponse { accepted: true }) => {
             PairingAction {
                 next: PairingState::Idle,
                 send: None,
                 pin: true,
+                notify_code: None,
+            }
+        }
+
+        // Ya confirmamos localmente pero el par rechaza: se cancela sin fijar. Es
+        // el caso que el bug dejaba pasar —fijaba igual—.
+        (
+            PairingState::OutgoingConfirmed { .. },
+            PairingEvent::PeerResponse { accepted: false },
+        ) => PairingAction {
+            next: PairingState::Idle,
+            send: None,
+            pin: false,
+            notify_code: None,
+        },
+
+        // Ya confirmamos localmente y la persona se arrepiente: se cancela.
+        (PairingState::OutgoingConfirmed { .. }, PairingEvent::LocalConfirm { accept: false }) => {
+            PairingAction {
+                next: PairingState::Idle,
+                send: None,
+                pin: false,
                 notify_code: None,
             }
         }
@@ -416,6 +488,18 @@ pub fn accept_new_session(current: usize, max: usize) -> bool {
 /// vez de quedar colgada ocupando memoria.
 pub fn keepalive_exhausted(missed_pongs: u32, max: u32) -> bool {
     missed_pongs >= max
+}
+
+/// La etiqueta de instancia DNS-SD para un `device_id`.
+///
+/// Una etiqueta DNS-SD no pasa de 63 octetos, así que se recorta a 40 **por
+/// caracteres**, no por bytes: cortar `&id[..40]` a secas revienta con un
+/// `panic` si el byte 40 cae en medio de un carácter multibyte, y el `device_id`
+/// de descubrimiento sale de un anuncio ajeno. Con caracteres el corte siempre es
+/// válido. Nuestros ids son hexadecimales (ASCII), pero esto lo deja a salvo de un
+/// id hostil que no lo sea.
+pub fn mdns_instance_label(device_id: &str) -> String {
+    device_id.chars().take(40).collect()
 }
 
 /// Qué hacer con una conexión que llega, según si ya hay una sesión con ese par.
@@ -837,10 +921,17 @@ mod tests {
     }
 
     #[test]
-    fn confirmar_un_pedido_saliente_fija_al_par() {
+    fn confirmar_un_pedido_saliente_antes_de_la_respuesta_no_fija_todavia() {
+        // Confirmación local antes de que el par conteste: se anota y se espera,
+        // no se fija. qa amplía: los dos órdenes y el rechazo tardío.
         let action = advance_pairing(&pending_out(), PairingEvent::LocalConfirm { accept: true });
-        assert!(action.pin);
-        assert_eq!(action.next, PairingState::Idle);
+        assert!(!action.pin);
+        assert_eq!(
+            action.next,
+            PairingState::OutgoingConfirmed {
+                code: "123456".into()
+            }
+        );
     }
 
     #[test]
