@@ -10,7 +10,9 @@
 use std::collections::HashMap;
 
 use sha2::{Digest, Sha256};
-use vasak_connect_protocol::wire::{self, DeviceKind, Message, PeerInfo, PROTOCOL_VERSION};
+use vasak_connect_protocol::wire::{
+    self, BatteryStatus, DeviceKind, Message, PeerInfo, PROTOCOL_VERSION,
+};
 
 // ── Huellas e identidad ──────────────────────────────────────────────────────
 
@@ -624,6 +626,35 @@ pub fn self_name(etc_hostname: Option<&str>) -> String {
         .to_string()
 }
 
+/// Decide qué hacer con un estado de batería que empuja un par, en el borde de
+/// confianza de la red.
+///
+/// Devuelve `None` —y no se muestra nada— si el par no está pareado: un aparato
+/// sin parear no empuja estado nuestro. Si está pareado, el nivel se **recorta a
+/// 0–100**: `level` es un `u8` que por el cable puede llegar hasta 255, y un par
+/// malicioso o con un bug no debe poder pintar "237 %" en el panel.
+pub fn sanitize_incoming_battery(paired: bool, raw: BatteryStatus) -> Option<BatteryStatus> {
+    if !paired {
+        return None;
+    }
+    Some(BatteryStatus {
+        level: raw.level.min(100),
+        charging: raw.charging,
+    })
+}
+
+/// Decide qué hacer con un texto de portapapeles que empuja un par.
+///
+/// `None` si el par no está pareado —escribir en el portapapeles de quien usa el
+/// sistema desde un aparato sin parear es una inyección— o si el texto es vacío,
+/// que no aporta nada. El tope de tamaño ya lo pone el marco ([`MAX_FRAME`]).
+pub fn accept_incoming_clipboard(paired: bool, text: String) -> Option<String> {
+    if !paired || text.is_empty() {
+        return None;
+    }
+    Some(text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1206,5 +1237,54 @@ mod tests {
             checked_incoming_code("AA:BB:CC:DD", "11:22:33:44", &code),
             Some(code)
         );
+    }
+
+    #[test]
+    fn la_bateria_de_un_par_sin_parear_se_ignora() {
+        let raw = BatteryStatus {
+            level: 50,
+            charging: true,
+        };
+        assert_eq!(sanitize_incoming_battery(false, raw), None);
+    }
+
+    #[test]
+    fn la_bateria_de_un_par_pareado_se_recorta_a_100() {
+        let raw = BatteryStatus {
+            level: 250,
+            charging: false,
+        };
+        let out = sanitize_incoming_battery(true, raw).expect("pareado: se acepta");
+        assert_eq!(out.level, 100);
+        assert!(!out.charging);
+    }
+
+    #[test]
+    fn la_bateria_valida_de_un_par_pareado_pasa_tal_cual() {
+        let raw = BatteryStatus {
+            level: 80,
+            charging: true,
+        };
+        let out = sanitize_incoming_battery(true, raw).expect("pareado: se acepta");
+        assert_eq!(out.level, 80);
+        assert!(out.charging);
+    }
+
+    #[test]
+    fn el_portapapeles_de_un_par_sin_parear_se_ignora() {
+        assert_eq!(accept_incoming_clipboard(false, "hola".into()), None);
+    }
+
+    #[test]
+    fn el_portapapeles_de_un_par_pareado_pasa_tal_cual() {
+        assert_eq!(
+            accept_incoming_clipboard(true, "hola mundo".into()),
+            Some("hola mundo".to_string())
+        );
+    }
+
+    #[test]
+    fn el_portapapeles_vacio_de_un_par_pareado_se_ignora() {
+        assert_eq!(accept_incoming_clipboard(true, String::new()), None);
     }
 }
