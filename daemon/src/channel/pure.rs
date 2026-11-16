@@ -9,7 +9,9 @@
 
 use std::collections::HashMap;
 
+use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use vasak_connect_protocol::wire::{
     self, BatteryStatus, DeviceKind, Message, PeerInfo, PROTOCOL_VERSION,
 };
@@ -244,21 +246,82 @@ pub fn verify_hello(peer: &PeerInfo, tls_fingerprint: &str) -> Result<(), HelloE
     Ok(())
 }
 
-/// El código que las dos pantallas muestran durante el pareo, sobre nuestra
-/// huella y la del par. Reexporta el del contrato para que el código del canal
-/// no vuelva a implementarlo.
-pub fn verification_code(own_fingerprint: &str, peer_fingerprint: &str) -> String {
-    wire::verification_code(own_fingerprint, peer_fingerprint)
+// ── SAS con compromiso (RFC 6189) ────────────────────────────────────────────
+//
+// El pareo ya no deriva un código de dos huellas públicas de larga vida —que un
+// intermediario on-path podría grindear offline hasta que las dos pantallas
+// coincidan—. Ahora las dos puntas hacen un Diffie-Hellman efímero (X25519) y el
+// SAS sale del secreto compartido, atado además a las dos huellas de certificado.
+// El iniciador se **compromete** a su clave DH antes de ver la del par
+// (commit-then-reveal), así no puede elegirla después para forzar un SAS: sin el
+// compromiso, grindear 10^6 claves hasta un SAS de seis dígitos sería barato.
+
+/// El compromiso a una clave DH efímera: `hex(SHA-256(dh_pub))`.
+///
+/// El iniciador lo manda en el `PairRequest` antes de revelar su clave. Como es
+/// un hash de la clave, no deja deducirla, pero lo ata: al revelar la clave, el
+/// respondedor comprueba que su hash sea éste ([`verify_commitment`]).
+pub fn sas_commitment(dh_pub: &[u8]) -> String {
+    hex::encode(Sha256::digest(dh_pub))
+}
+
+/// Comprueba que una clave DH revelada corresponda al compromiso recibido,
+/// recomputando `SHA-256(dh_pub)` y comparándolo **en tiempo constante**.
+///
+/// La comparación en tiempo constante evita filtrar por tiempo cuántos
+/// caracteres del compromiso coinciden; un compromiso con otro largo del
+/// esperado da `false` sin más (el largo no es secreto). Que dé `false` es la
+/// señal de que el par reveló una clave distinta de la que se comprometió —un
+/// intermediario—, y el pareo se aborta.
+pub fn verify_commitment(expected_hex: &str, dh_pub: &[u8]) -> bool {
+    let computed = hex::encode(Sha256::digest(dh_pub));
+    computed.as_bytes().ct_eq(expected_hex.as_bytes()).into()
+}
+
+/// Deriva el SAS de seis dígitos que las dos pantallas muestran, idéntico en
+/// ambos lados.
+///
+/// Sale de HKDF-SHA256 sobre el secreto compartido del DH, con un label de
+/// dominio como sal e `info = init_pub || resp_pub || init_fp || resp_fp`. El
+/// orden es **siempre el iniciador primero** —los dos lados saben quién inició—,
+/// así las dos puntas derivan el mismo número. Incluir las dos huellas de
+/// certificado ata el SAS acordado a los certificados exactos que se van a fijar:
+/// si un intermediario cambiara un certificado después de acordar el SAS, el
+/// número no coincidiría.
+pub fn derive_sas(
+    shared: &[u8],
+    init_pub: &[u8],
+    resp_pub: &[u8],
+    init_fp: &str,
+    resp_fp: &str,
+) -> String {
+    let hk = Hkdf::<Sha256>::new(Some(b"VASAK-SAS-v2"), shared);
+    let mut info =
+        Vec::with_capacity(init_pub.len() + resp_pub.len() + init_fp.len() + resp_fp.len());
+    info.extend_from_slice(init_pub);
+    info.extend_from_slice(resp_pub);
+    info.extend_from_slice(init_fp.as_bytes());
+    info.extend_from_slice(resp_fp.as_bytes());
+    let mut okm = [0u8; 8];
+    // `expand` sólo falla si se piden más de 255*32 bytes; ocho entran de sobra,
+    // así que esto no puede fallar con un dato de red —es una invariante del
+    // largo fijo, no una entrada—.
+    hk.expand(&info, &mut okm)
+        .expect("ocho bytes caben en un OKM de HKDF-SHA256");
+    let value = u64::from_be_bytes(okm) % 1_000_000;
+    format!("{value:06}")
 }
 
 // ── Máquina de estados del pareo ─────────────────────────────────────────────
 //
 // La invariante que esta máquina hace cumplir: **un par se fija como de confianza
-// SÓLO cuando la persona local confirma el código** (`PairingEvent::LocalConfirm
+// SÓLO cuando la persona local confirma el SAS** (`PairingEvent::LocalConfirm
 // { accept: true }` sobre un pareo pendiente). Ningún mensaje del par —ni un
 // `PairResponse { accepted: true }` no pedido— vuelve a un par de confianza por
 // sí solo. Toda la lógica del pareo pasa por `advance_pairing`, que es pura: el
-// código de red sólo aplica lo que ésta decide (mandar un mensaje, fijar, avisar).
+// código de red sólo aplica lo que ésta decide (mandar un mensaje, fijar, avisar,
+// abortar). El SAS lo deriva el código del canal del secreto compartido del DH
+// ([`derive_sas`]) y se lo pasa a esta máquina en el evento; acá sólo se enruta.
 
 /// El estado del pareo de una sesión.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -266,26 +329,50 @@ pub enum PairingState {
     /// Sin pareo en curso.
     #[default]
     Idle,
-    /// Nosotros pedimos parear y esperamos: que la persona local confirme el
-    /// código, y que el par conteste que acepta. `peer_accepted` dice si el par ya
-    /// contestó que sí; aun así no se fija hasta la confirmación local.
-    OutgoingPending { code: String, peer_accepted: bool },
-    /// Nosotros pedimos parear, la persona local **ya confirmó** el código, y
-    /// falta la respuesta del par. Se fija recién cuando el par acepta: así, si la
-    /// confirmación local llega antes que el `PairResponse`, un `accepted: false`
-    /// posterior cancela en vez de dejar fijado a un par que rechazó.
-    OutgoingConfirmed { code: String },
-    /// El par pidió parear y esperamos la confirmación local.
-    IncomingPending { code: String },
+    /// Iniciador: mandamos el `PairRequest` con nuestro compromiso y esperamos
+    /// que el par revele su clave DH (`PairDh`). Todavía no hay SAS: falta el
+    /// aporte del par.
+    OutgoingCommitted,
+    /// Iniciador: ya revelamos nuestra clave y derivamos el SAS; esperamos la
+    /// confirmación local y la respuesta del par. `peer_accepted` dice si el par
+    /// ya contestó que sí; aun así no se fija hasta la confirmación local.
+    OutgoingPending { sas: String, peer_accepted: bool },
+    /// Iniciador: la persona local **ya confirmó** el SAS y falta la respuesta
+    /// del par. Se fija recién cuando el par acepta: así, si la confirmación
+    /// local llega antes que el `PairResponse`, un `accepted: false` posterior
+    /// cancela en vez de dejar fijado a un par que rechazó.
+    OutgoingConfirmed { sas: String },
+    /// Respondedor: el par pidió parear y guardamos su compromiso; ya revelamos
+    /// nuestra clave DH (`PairDh`) y esperamos que revele la suya (`PairReveal`)
+    /// para verificar el compromiso. Todavía no hay SAS.
+    IncomingCommitted { commitment: String },
+    /// Respondedor: el par reveló su clave, el compromiso verificó y derivamos el
+    /// SAS; esperamos la confirmación local.
+    IncomingPending { sas: String },
 }
 
 /// Lo que mueve la máquina de pareo.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PairingEvent {
-    /// La persona local pidió iniciar el pareo (`request_pairing`).
-    LocalInitiate { code: String },
-    /// Llegó un `PairRequest` del par.
-    PeerRequest { code: String },
+    /// La persona local pidió iniciar el pareo (`request_pairing`). El canal ya
+    /// generó la clave DH efímera y calculó el `commitment`.
+    LocalInitiate { commitment: String },
+    /// Llegó un `PairRequest` del par. El canal ya generó nuestra clave DH; pasa
+    /// el `commitment` del par y nuestra clave pública en hex (`own_dh_pub`) para
+    /// revelarla en el `PairDh`.
+    PeerRequest {
+        commitment: String,
+        own_dh_pub: String,
+    },
+    /// Llegó un `PairDh` del par (reveló su clave, somos el iniciador). El canal
+    /// ya computó el secreto compartido y derivó el SAS; `reveal` es nuestra
+    /// clave en hex, a mandar en el `PairReveal`.
+    PeerDh { reveal: String, sas: String },
+    /// Llegó un `PairReveal` del par (reveló su clave, somos el respondedor).
+    /// `revealed` son los bytes crudos de su clave, que se verifican contra el
+    /// `commitment` guardado; `sas` es el que el canal derivó del secreto
+    /// compartido.
+    PeerReveal { revealed: Vec<u8>, sas: String },
     /// Llegó un `PairResponse` del par.
     PeerResponse { accepted: bool },
     /// La persona local confirmó o rechazó (`confirm_pairing`).
@@ -293,7 +380,7 @@ pub enum PairingEvent {
 }
 
 /// Qué hacer tras un evento: a qué estado pasar, qué mandarle al par, si fijarlo
-/// como de confianza, y si avisar a la persona con un código.
+/// como de confianza, si avisar a la persona con el SAS, y si abortar la sesión.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PairingAction {
     pub next: PairingState,
@@ -302,9 +389,12 @@ pub struct PairingAction {
     /// Fijar al par como de confianza. **Sólo es `true` en respuesta a
     /// `LocalConfirm { accept: true }` sobre un pareo pendiente.**
     pub pin: bool,
-    /// Código a mostrarle a la persona (emitir `pairing_requested`), si hay que
+    /// SAS a mostrarle a la persona (emitir `pairing_requested`), si hay que
     /// pedirle una confirmación.
     pub notify_code: Option<String>,
+    /// Abortar: el compromiso no verificó (señal del intermediario). El canal
+    /// cierra y resetea la sesión; nunca se fija nada.
+    pub abort: bool,
 }
 
 impl PairingAction {
@@ -317,6 +407,29 @@ impl PairingAction {
             send: None,
             pin: false,
             notify_code: None,
+            abort: false,
+        }
+    }
+
+    /// Cancela el pareo: vuelve a reposo sin fijar nada. No cierra la sesión.
+    fn cancel() -> Self {
+        PairingAction {
+            next: PairingState::Idle,
+            send: None,
+            pin: false,
+            notify_code: None,
+            abort: false,
+        }
+    }
+
+    /// Fija al par y vuelve a reposo. Es la única salida con `pin: true`.
+    fn pinned() -> Self {
+        PairingAction {
+            next: PairingState::Idle,
+            send: None,
+            pin: true,
+            notify_code: None,
+            abort: false,
         }
     }
 }
@@ -325,53 +438,95 @@ impl PairingAction {
 /// reloj; devuelve qué hacer y el código de red lo aplica.
 pub fn advance_pairing(state: &PairingState, event: PairingEvent) -> PairingAction {
     match (state, event) {
-        // Iniciamos nosotros: mandamos el pedido y le mostramos el código a la
-        // persona para que lo confirme.
-        (PairingState::Idle, PairingEvent::LocalInitiate { code }) => PairingAction {
+        // Iniciamos nosotros: mandamos el compromiso y esperamos la clave DH del
+        // par. Todavía no hay SAS que mostrar.
+        (PairingState::Idle, PairingEvent::LocalInitiate { commitment }) => PairingAction {
+            next: PairingState::OutgoingCommitted,
+            send: Some(Message::PairRequest { commitment }),
+            pin: false,
+            notify_code: None,
+            abort: false,
+        },
+
+        // El par pide parear y se compromete: guardamos su compromiso y revelamos
+        // nuestra clave DH. No se fija nada ni se muestra SAS: falta que el par
+        // revele su clave para verificar el compromiso y derivar el SAS.
+        (
+            PairingState::Idle,
+            PairingEvent::PeerRequest {
+                commitment,
+                own_dh_pub,
+            },
+        ) => PairingAction {
+            next: PairingState::IncomingCommitted { commitment },
+            send: Some(Message::PairDh { dh_pub: own_dh_pub }),
+            pin: false,
+            notify_code: None,
+            abort: false,
+        },
+
+        // Somos el iniciador y el par reveló su clave: revelamos la nuestra, ya
+        // derivamos el SAS y lo mostramos. Esperamos la confirmación local y el
+        // `PairResponse`.
+        (PairingState::OutgoingCommitted, PairingEvent::PeerDh { reveal, sas }) => PairingAction {
             next: PairingState::OutgoingPending {
-                code: code.clone(),
+                sas: sas.clone(),
                 peer_accepted: false,
             },
-            send: Some(Message::PairRequest {
-                verification: code.clone(),
-            }),
+            send: Some(Message::PairReveal { dh_pub: reveal }),
             pin: false,
-            notify_code: Some(code),
+            notify_code: Some(sas),
+            abort: false,
         },
 
-        // El par pide parear: mostramos el código y esperamos la confirmación
-        // local. No se fija nada acá.
-        (PairingState::Idle, PairingEvent::PeerRequest { code }) => PairingAction {
-            next: PairingState::IncomingPending { code: code.clone() },
-            send: None,
-            pin: false,
-            notify_code: Some(code),
-        },
+        // Somos el respondedor y el par reveló su clave: se verifica que su hash
+        // coincida con el compromiso guardado, en tiempo constante. Si no
+        // coincide, el par reveló una clave distinta de la que se comprometió —un
+        // intermediario— y se aborta sin fijar nada. Si coincide, mostramos el SAS
+        // y esperamos la confirmación local.
+        (
+            PairingState::IncomingCommitted { commitment },
+            PairingEvent::PeerReveal { revealed, sas },
+        ) => {
+            if verify_commitment(commitment, &revealed) {
+                PairingAction {
+                    next: PairingState::IncomingPending { sas: sas.clone() },
+                    send: None,
+                    pin: false,
+                    notify_code: Some(sas),
+                    abort: false,
+                }
+            } else {
+                PairingAction {
+                    next: PairingState::Idle,
+                    send: None,
+                    pin: false,
+                    notify_code: None,
+                    abort: true,
+                }
+            }
+        }
 
         // El par acepta nuestro pedido: lo anotamos, pero **no se fija**: falta la
-        // confirmación local. Se vuelve a mostrar el código para que la persona
-        // pueda confirmar.
+        // confirmación local. Se vuelve a mostrar el SAS para que la persona pueda
+        // confirmar.
         (
-            PairingState::OutgoingPending { code, .. },
+            PairingState::OutgoingPending { sas, .. },
             PairingEvent::PeerResponse { accepted: true },
         ) => PairingAction {
             next: PairingState::OutgoingPending {
-                code: code.clone(),
+                sas: sas.clone(),
                 peer_accepted: true,
             },
             send: None,
             pin: false,
-            notify_code: Some(code.clone()),
+            notify_code: Some(sas.clone()),
+            abort: false,
         },
 
         // El par rechaza nuestro pedido: se cancela.
         (PairingState::OutgoingPending { .. }, PairingEvent::PeerResponse { accepted: false }) => {
-            PairingAction {
-                next: PairingState::Idle,
-                send: None,
-                pin: false,
-                notify_code: None,
-            }
+            PairingAction::cancel()
         }
 
         // La persona confirma un pedido saliente **que el par ya aceptó**: los dos
@@ -382,37 +537,28 @@ pub fn advance_pairing(state: &PairingState, event: PairingEvent) -> PairingActi
                 ..
             },
             PairingEvent::LocalConfirm { accept: true },
-        ) => PairingAction {
-            next: PairingState::Idle,
-            send: None,
-            pin: true,
-            notify_code: None,
-        },
+        ) => PairingAction::pinned(),
 
         // La persona confirma un pedido saliente **antes de que el par conteste**:
         // se anota la confirmación local y se espera; recién se fija cuando el par
         // acepte. Si el par rechaza después, se cancela sin haber fijado.
         (
             PairingState::OutgoingPending {
-                code,
+                sas,
                 peer_accepted: false,
             },
             PairingEvent::LocalConfirm { accept: true },
         ) => PairingAction {
-            next: PairingState::OutgoingConfirmed { code: code.clone() },
+            next: PairingState::OutgoingConfirmed { sas: sas.clone() },
             send: None,
             pin: false,
             notify_code: None,
+            abort: false,
         },
 
         // Ya confirmamos localmente y el par acepta: los dos aceptaron, se fija.
         (PairingState::OutgoingConfirmed { .. }, PairingEvent::PeerResponse { accepted: true }) => {
-            PairingAction {
-                next: PairingState::Idle,
-                send: None,
-                pin: true,
-                notify_code: None,
-            }
+            PairingAction::pinned()
         }
 
         // Ya confirmamos localmente pero el par rechaza: se cancela sin fijar. Es
@@ -420,21 +566,11 @@ pub fn advance_pairing(state: &PairingState, event: PairingEvent) -> PairingActi
         (
             PairingState::OutgoingConfirmed { .. },
             PairingEvent::PeerResponse { accepted: false },
-        ) => PairingAction {
-            next: PairingState::Idle,
-            send: None,
-            pin: false,
-            notify_code: None,
-        },
+        ) => PairingAction::cancel(),
 
         // Ya confirmamos localmente y la persona se arrepiente: se cancela.
         (PairingState::OutgoingConfirmed { .. }, PairingEvent::LocalConfirm { accept: false }) => {
-            PairingAction {
-                next: PairingState::Idle,
-                send: None,
-                pin: false,
-                notify_code: None,
-            }
+            PairingAction::cancel()
         }
 
         // La persona confirma un pedido entrante: se fija y se le contesta que sí
@@ -445,6 +581,7 @@ pub fn advance_pairing(state: &PairingState, event: PairingEvent) -> PairingActi
                 send: Some(Message::PairResponse { accepted: true }),
                 pin: true,
                 notify_code: None,
+                abort: false,
             }
         }
 
@@ -455,17 +592,13 @@ pub fn advance_pairing(state: &PairingState, event: PairingEvent) -> PairingActi
                 send: Some(Message::PairResponse { accepted: false }),
                 pin: false,
                 notify_code: None,
+                abort: false,
             }
         }
 
         // La persona rechaza un pedido saliente: se cancela sin fijar.
         (PairingState::OutgoingPending { .. }, PairingEvent::LocalConfirm { accept: false }) => {
-            PairingAction {
-                next: PairingState::Idle,
-                send: None,
-                pin: false,
-                notify_code: None,
-            }
+            PairingAction::cancel()
         }
 
         // Todo lo demás no corresponde al estado y no hace nada. En particular, un
@@ -541,24 +674,6 @@ pub fn admit_session(slot_occupied: bool, current_count: usize, max: usize) -> S
 /// suya.
 pub fn owns_session_slot(current: Option<u64>, mine: u64) -> bool {
     current == Some(mine)
-}
-
-/// Recalcula localmente el código de verificación de un pareo **entrante** y lo
-/// compara con el que mandó el par.
-///
-/// El pinning es TOFU (se confía la primera vez), así que este código es la única
-/// defensa humana contra un intermediario en el primer pareo: tiene que salir de
-/// las dos huellas que vemos nosotros, no del dato que manda el par —si no, un
-/// intermediario podría hacer coincidir las dos pantallas—. Devuelve el código
-/// local a mostrar si coincide con el declarado, o `None` si no, en cuyo caso el
-/// pareo se ignora.
-pub fn checked_incoming_code(
-    own_fingerprint: &str,
-    peer_fingerprint: &str,
-    claimed: &str,
-) -> Option<String> {
-    let local = verification_code(own_fingerprint, peer_fingerprint);
-    (local == claimed).then_some(local)
 }
 
 // ── Anuncio mDNS: registro TXT ───────────────────────────────────────────────
@@ -810,14 +925,6 @@ mod tests {
         assert!(HelloError::IncompatibleVersion(9).to_string().contains('9'));
     }
 
-    #[test]
-    fn el_codigo_de_verificacion_es_el_del_contrato() {
-        assert_eq!(
-            verification_code("AA", "BB"),
-            wire::verification_code("AA", "BB")
-        );
-    }
-
     fn txt_map(peer: &PeerInfo) -> HashMap<String, String> {
         build_txt(peer).into_iter().collect()
     }
@@ -869,18 +976,11 @@ mod tests {
         assert_eq!(self_name(None), "VasakOS");
     }
 
-    fn pending_out() -> PairingState {
-        PairingState::OutgoingPending {
-            code: "123456".into(),
-            peer_accepted: false,
-        }
-    }
-
-    fn pending_in() -> PairingState {
-        PairingState::IncomingPending {
-            code: "123456".into(),
-        }
-    }
+    // Las pruebas de la máquina de pareo con compromiso (iniciar, el ciclo
+    // commit→reveal, la verificación del commitment y el aborto, fijar sólo con
+    // la confirmación local en cualquier orden) las escribe `qa` sobre la API
+    // nueva. Acá quedan sólo las dos invariantes que no dependen de la forma de
+    // los estados: un mensaje del par en reposo no fija ni avisa.
 
     #[test]
     fn un_pair_response_no_pedido_no_fija_a_nadie() {
@@ -891,86 +991,10 @@ mod tests {
             PairingEvent::PeerResponse { accepted: true },
         );
         assert!(!action.pin);
+        assert!(!action.abort);
         assert_eq!(action.next, PairingState::Idle);
         assert_eq!(action.send, None);
         assert_eq!(action.notify_code, None);
-    }
-
-    #[test]
-    fn iniciar_el_pareo_manda_el_pedido_y_muestra_el_codigo_sin_fijar() {
-        let action = advance_pairing(
-            &PairingState::Idle,
-            PairingEvent::LocalInitiate { code: "111".into() },
-        );
-        assert!(!action.pin);
-        assert_eq!(
-            action.next,
-            PairingState::OutgoingPending {
-                code: "111".into(),
-                peer_accepted: false
-            }
-        );
-        assert_eq!(
-            action.send,
-            Some(Message::PairRequest {
-                verification: "111".into()
-            })
-        );
-        assert_eq!(action.notify_code.as_deref(), Some("111"));
-    }
-
-    #[test]
-    fn un_pedido_del_par_muestra_el_codigo_y_espera_sin_fijar() {
-        let action = advance_pairing(
-            &PairingState::Idle,
-            PairingEvent::PeerRequest { code: "222".into() },
-        );
-        assert!(!action.pin);
-        assert_eq!(
-            action.next,
-            PairingState::IncomingPending { code: "222".into() }
-        );
-        assert_eq!(action.notify_code.as_deref(), Some("222"));
-        assert_eq!(action.send, None);
-    }
-
-    #[test]
-    fn el_par_que_acepta_nuestro_pedido_se_anota_pero_no_se_fija() {
-        let action = advance_pairing(
-            &pending_out(),
-            PairingEvent::PeerResponse { accepted: true },
-        );
-        assert!(!action.pin);
-        assert_eq!(
-            action.next,
-            PairingState::OutgoingPending {
-                code: "123456".into(),
-                peer_accepted: true
-            }
-        );
-        assert_eq!(action.notify_code.as_deref(), Some("123456"));
-    }
-
-    #[test]
-    fn confirmar_un_pedido_saliente_antes_de_la_respuesta_no_fija_todavia() {
-        // Confirmación local antes de que el par conteste: se anota y se espera,
-        // no se fija.
-        let action = advance_pairing(&pending_out(), PairingEvent::LocalConfirm { accept: true });
-        assert!(!action.pin);
-        assert_eq!(
-            action.next,
-            PairingState::OutgoingConfirmed {
-                code: "123456".into()
-            }
-        );
-    }
-
-    #[test]
-    fn confirmar_un_pedido_entrante_fija_y_contesta_que_si() {
-        let action = advance_pairing(&pending_in(), PairingEvent::LocalConfirm { accept: true });
-        assert!(action.pin);
-        assert_eq!(action.next, PairingState::Idle);
-        assert_eq!(action.send, Some(Message::PairResponse { accepted: true }));
     }
 
     #[test]
@@ -984,35 +1008,261 @@ mod tests {
         }
     }
 
+    // ── SAS con compromiso (RFC 6189) ────────────────────────────────────────
+
     #[test]
-    fn los_rechazos_no_fijan_y_vuelven_a_reposo() {
-        let par_rechaza = advance_pairing(
-            &pending_out(),
-            PairingEvent::PeerResponse { accepted: false },
-        );
-        assert!(!par_rechaza.pin);
-        assert_eq!(par_rechaza.next, PairingState::Idle);
-
-        let local_rechaza_saliente =
-            advance_pairing(&pending_out(), PairingEvent::LocalConfirm { accept: false });
-        assert!(!local_rechaza_saliente.pin);
-        assert_eq!(local_rechaza_saliente.next, PairingState::Idle);
-
-        let local_rechaza_entrante =
-            advance_pairing(&pending_in(), PairingEvent::LocalConfirm { accept: false });
-        assert!(!local_rechaza_entrante.pin);
-        assert_eq!(local_rechaza_entrante.next, PairingState::Idle);
+    fn el_compromiso_es_el_sha256_en_hex_de_la_clave() {
+        // SHA-256("abc"), vector conocido.
         assert_eq!(
-            local_rechaza_entrante.send,
-            Some(Message::PairResponse { accepted: false })
+            sas_commitment(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
     }
 
     #[test]
-    fn un_pair_response_con_un_pedido_entrante_no_fija() {
-        let action = advance_pairing(&pending_in(), PairingEvent::PeerResponse { accepted: true });
+    fn el_compromiso_verifica_solo_con_la_clave_comprometida() {
+        let key = [7u8; 32];
+        let commitment = sas_commitment(&key);
+        assert!(verify_commitment(&commitment, &key));
+
+        let mut other = key;
+        other[31] ^= 1;
+        assert!(!verify_commitment(&commitment, &other));
+    }
+
+    #[test]
+    fn un_compromiso_de_otro_largo_se_rechaza_sin_panico() {
+        let key = [7u8; 32];
+        let commitment = sas_commitment(&key);
+        assert!(!verify_commitment("", &key));
+        assert!(!verify_commitment(
+            &commitment[..commitment.len() - 1],
+            &key
+        ));
+        assert!(!verify_commitment(&format!("{commitment}00"), &key));
+    }
+
+    const SHARED: [u8; 32] = [1; 32];
+    const INIT_PUB: [u8; 32] = [2; 32];
+    const RESP_PUB: [u8; 32] = [3; 32];
+
+    fn sas() -> String {
+        derive_sas(&SHARED, &INIT_PUB, &RESP_PUB, "AA:BB", "CC:DD")
+    }
+
+    #[test]
+    fn el_sas_es_determinista_y_de_seis_digitos() {
+        assert_eq!(sas(), sas());
+        for i in 0..50u8 {
+            let s = derive_sas(&[i; 32], &INIT_PUB, &RESP_PUB, "AA:BB", "CC:DD");
+            assert_eq!(s.len(), 6, "{s}");
+            assert!(s.bytes().all(|b| b.is_ascii_digit()), "{s}");
+        }
+    }
+
+    #[test]
+    fn el_sas_cambia_si_cambia_cualquier_entrada() {
+        let base = sas();
+        let mut other_shared = SHARED;
+        other_shared[0] ^= 1;
+        let mut other_init = INIT_PUB;
+        other_init[0] ^= 1;
+        let mut other_resp = RESP_PUB;
+        other_resp[0] ^= 1;
+        let variants = [
+            derive_sas(&other_shared, &INIT_PUB, &RESP_PUB, "AA:BB", "CC:DD"),
+            derive_sas(&SHARED, &other_init, &RESP_PUB, "AA:BB", "CC:DD"),
+            derive_sas(&SHARED, &INIT_PUB, &other_resp, "AA:BB", "CC:DD"),
+            derive_sas(&SHARED, &INIT_PUB, &RESP_PUB, "AA:BC", "CC:DD"),
+            derive_sas(&SHARED, &INIT_PUB, &RESP_PUB, "AA:BB", "CC:DE"),
+        ];
+        for (i, v) in variants.iter().enumerate() {
+            assert_ne!(*v, base, "la variante {i} no cambió el SAS");
+        }
+    }
+
+    #[test]
+    fn los_dos_lados_derivan_el_mismo_sas_con_el_orden_iniciador_primero() {
+        use ring::agreement::{agree_ephemeral, EphemeralPrivateKey, UnparsedPublicKey, X25519};
+        use ring::rand::SystemRandom;
+        let rng = SystemRandom::new();
+        let a = EphemeralPrivateKey::generate(&X25519, &rng).unwrap();
+        let b = EphemeralPrivateKey::generate(&X25519, &rng).unwrap();
+        let a_pub = a.compute_public_key().unwrap().as_ref().to_vec();
+        let b_pub = b.compute_public_key().unwrap().as_ref().to_vec();
+        let shared_a =
+            agree_ephemeral(a, &UnparsedPublicKey::new(&X25519, &b_pub), |k| k.to_vec()).unwrap();
+        let shared_b =
+            agree_ephemeral(b, &UnparsedPublicKey::new(&X25519, &a_pub), |k| k.to_vec()).unwrap();
+        assert_eq!(shared_a, shared_b);
+
+        let initiator = derive_sas(&shared_a, &a_pub, &b_pub, "FP-INIT", "FP-RESP");
+        let responder = derive_sas(&shared_b, &a_pub, &b_pub, "FP-INIT", "FP-RESP");
+        assert_eq!(initiator, responder);
+        // Y el orden importa: invertirlo da otro número.
+        let swapped = derive_sas(&shared_a, &b_pub, &a_pub, "FP-RESP", "FP-INIT");
+        assert_ne!(initiator, swapped);
+    }
+
+    #[test]
+    fn iniciar_manda_el_compromiso_y_todavia_no_hay_sas_ni_se_fija() {
+        let action = advance_pairing(
+            &PairingState::Idle,
+            PairingEvent::LocalInitiate {
+                commitment: "c0ffee".into(),
+            },
+        );
+        assert_eq!(action.next, PairingState::OutgoingCommitted);
+        assert_eq!(
+            action.send,
+            Some(Message::PairRequest {
+                commitment: "c0ffee".into()
+            })
+        );
+        assert_eq!(action.notify_code, None);
         assert!(!action.pin);
-        assert_eq!(action.next, pending_in());
+        assert!(!action.abort);
+    }
+
+    #[test]
+    fn el_iniciador_completa_commit_reveal_y_fija_solo_con_la_confirmacion_local() {
+        let a = advance_pairing(
+            &PairingState::Idle,
+            PairingEvent::LocalInitiate {
+                commitment: "cc".into(),
+            },
+        );
+        let b = advance_pairing(
+            &a.next,
+            PairingEvent::PeerDh {
+                reveal: "aa".into(),
+                sas: "123456".into(),
+            },
+        );
+        assert_eq!(
+            b.send,
+            Some(Message::PairReveal {
+                dh_pub: "aa".into()
+            })
+        );
+        assert_eq!(b.notify_code.as_deref(), Some("123456"));
+        assert!(!b.pin && !b.abort);
+
+        // La respuesta del par antes de la confirmación local no fija.
+        let c = advance_pairing(&b.next, PairingEvent::PeerResponse { accepted: true });
+        assert!(!c.pin);
+        let d = advance_pairing(&c.next, PairingEvent::LocalConfirm { accept: true });
+        assert!(d.pin);
+        assert_eq!(d.next, PairingState::Idle);
+    }
+
+    #[test]
+    fn el_iniciador_no_fija_en_ningun_orden_sin_los_dos_si() {
+        let pending = PairingState::OutgoingPending {
+            sas: "123456".into(),
+            peer_accepted: false,
+        };
+        // Confirma local y luego el par acepta: fija recién al final.
+        let a = advance_pairing(&pending, PairingEvent::LocalConfirm { accept: true });
+        assert!(!a.pin);
+        assert!(advance_pairing(&a.next, PairingEvent::PeerResponse { accepted: true }).pin);
+        // Confirma local y luego el par rechaza: no fija.
+        assert!(!advance_pairing(&a.next, PairingEvent::PeerResponse { accepted: false }).pin);
+        // El par rechaza primero o la persona rechaza: no fija.
+        assert!(!advance_pairing(&pending, PairingEvent::PeerResponse { accepted: false }).pin);
+        assert!(!advance_pairing(&pending, PairingEvent::LocalConfirm { accept: false }).pin);
+    }
+
+    #[test]
+    fn el_respondedor_revela_su_clave_y_espera_sin_sas() {
+        let action = advance_pairing(
+            &PairingState::Idle,
+            PairingEvent::PeerRequest {
+                commitment: "cc".into(),
+                own_dh_pub: "bb".into(),
+            },
+        );
+        assert_eq!(
+            action.next,
+            PairingState::IncomingCommitted {
+                commitment: "cc".into()
+            }
+        );
+        assert_eq!(
+            action.send,
+            Some(Message::PairDh {
+                dh_pub: "bb".into()
+            })
+        );
+        assert_eq!(action.notify_code, None);
+        assert!(!action.pin && !action.abort);
+    }
+
+    #[test]
+    fn el_respondedor_con_compromiso_valido_muestra_el_sas_y_fija_solo_al_confirmar() {
+        let key = vec![9u8; 32];
+        let committed = PairingState::IncomingCommitted {
+            commitment: sas_commitment(&key),
+        };
+        let shown = advance_pairing(
+            &committed,
+            PairingEvent::PeerReveal {
+                revealed: key,
+                sas: "654321".into(),
+            },
+        );
+        assert!(!shown.abort && !shown.pin);
+        assert_eq!(shown.notify_code.as_deref(), Some("654321"));
+        assert_eq!(
+            shown.next,
+            PairingState::IncomingPending {
+                sas: "654321".into()
+            }
+        );
+
+        let yes = advance_pairing(&shown.next, PairingEvent::LocalConfirm { accept: true });
+        assert!(yes.pin);
+        assert_eq!(yes.send, Some(Message::PairResponse { accepted: true }));
+
+        let no = advance_pairing(&shown.next, PairingEvent::LocalConfirm { accept: false });
+        assert!(!no.pin);
+        assert_eq!(no.send, Some(Message::PairResponse { accepted: false }));
+    }
+
+    #[test]
+    fn un_compromiso_que_no_coincide_aborta_sin_fijar_ni_mostrar_sas() {
+        // El MITM revela una clave distinta de la comprometida (grindeada).
+        let committed = PairingState::IncomingCommitted {
+            commitment: sas_commitment(&[1u8; 32]),
+        };
+        let action = advance_pairing(
+            &committed,
+            PairingEvent::PeerReveal {
+                revealed: vec![2u8; 32],
+                sas: "000000".into(),
+            },
+        );
+        assert!(action.abort);
+        assert!(!action.pin);
+        assert_eq!(action.next, PairingState::Idle);
+        assert_eq!(action.notify_code, None);
+        assert_eq!(action.send, None);
+    }
+
+    #[test]
+    fn un_reveal_fuera_de_turno_no_hace_nada() {
+        for state in [PairingState::Idle, PairingState::OutgoingCommitted] {
+            let action = advance_pairing(
+                &state,
+                PairingEvent::PeerReveal {
+                    revealed: vec![1],
+                    sas: "111111".into(),
+                },
+            );
+            assert!(!action.pin && !action.abort);
+            assert_eq!(action.next, state);
+            assert_eq!(action.notify_code, None);
+        }
     }
 
     #[test]
@@ -1062,132 +1312,6 @@ mod tests {
     }
 
     #[test]
-    fn un_codigo_declarado_que_no_coincide_se_ignora() {
-        let real = verification_code("AA:BB", "CC:DD");
-        assert_eq!(checked_incoming_code("AA:BB", "CC:DD", "000000"), None);
-        assert_eq!(checked_incoming_code("AA:BB", "CC:DD", ""), None);
-        // Un intermediario que declara el código de otro par de huellas.
-        let ajeno = verification_code("AA:BB", "EE:FF");
-        assert_ne!(ajeno, real);
-        assert_eq!(checked_incoming_code("AA:BB", "CC:DD", &ajeno), None);
-    }
-
-    #[test]
-    fn un_codigo_correcto_devuelve_el_recalculado_localmente() {
-        let real = verification_code("AA:BB", "CC:DD");
-        assert_eq!(
-            checked_incoming_code("AA:BB", "CC:DD", &real),
-            Some(real.clone())
-        );
-        // El código no depende de cuál huella es la propia.
-        assert_eq!(
-            checked_incoming_code("CC:DD", "AA:BB", &real),
-            Some(real.clone())
-        );
-        // Lo declarado se compara exacto: con espacios no es el mismo código, y lo
-        // que se devuelve nunca es el texto del par.
-        assert_eq!(
-            checked_incoming_code("AA:BB", "CC:DD", &format!(" {real} ")),
-            None
-        );
-    }
-
-    fn outgoing_confirmed() -> PairingState {
-        PairingState::OutgoingConfirmed {
-            code: "123456".into(),
-        }
-    }
-
-    #[test]
-    fn confirmar_y_despues_aceptar_el_par_fija() {
-        let confirmed =
-            advance_pairing(&pending_out(), PairingEvent::LocalConfirm { accept: true });
-        assert!(!confirmed.pin);
-        let accepted = advance_pairing(
-            &confirmed.next,
-            PairingEvent::PeerResponse { accepted: true },
-        );
-        assert!(accepted.pin);
-        assert_eq!(accepted.next, PairingState::Idle);
-    }
-
-    #[test]
-    fn aceptar_el_par_y_despues_confirmar_fija() {
-        let accepted = advance_pairing(
-            &pending_out(),
-            PairingEvent::PeerResponse { accepted: true },
-        );
-        assert!(!accepted.pin);
-        let confirmed =
-            advance_pairing(&accepted.next, PairingEvent::LocalConfirm { accept: true });
-        assert!(confirmed.pin);
-        assert_eq!(confirmed.next, PairingState::Idle);
-    }
-
-    #[test]
-    fn el_rechazo_tardio_del_par_cancela_sin_fijar() {
-        let action = advance_pairing(
-            &outgoing_confirmed(),
-            PairingEvent::PeerResponse { accepted: false },
-        );
-        assert!(!action.pin);
-        assert_eq!(action.next, PairingState::Idle);
-    }
-
-    #[test]
-    fn arrepentirse_tras_confirmar_cancela_sin_fijar() {
-        let action = advance_pairing(
-            &outgoing_confirmed(),
-            PairingEvent::LocalConfirm { accept: false },
-        );
-        assert!(!action.pin);
-        assert_eq!(action.next, PairingState::Idle);
-    }
-
-    #[test]
-    fn el_pareo_saliente_solo_fija_cuando_ambos_aceptaron_en_cualquier_orden() {
-        use PairingEvent::{LocalConfirm, PeerResponse};
-        let orders = [
-            [
-                LocalConfirm { accept: true },
-                PeerResponse { accepted: true },
-            ],
-            [
-                PeerResponse { accepted: true },
-                LocalConfirm { accept: true },
-            ],
-        ];
-        for order in orders {
-            let mut state = pending_out();
-            let mut pins = Vec::new();
-            for event in order {
-                let action = advance_pairing(&state, event);
-                pins.push(action.pin);
-                state = action.next;
-            }
-            assert_eq!(pins, [false, true]);
-        }
-        // Con un rechazo en cualquier punto nunca se fija.
-        for order in [
-            [
-                LocalConfirm { accept: true },
-                PeerResponse { accepted: false },
-            ],
-            [
-                PeerResponse { accepted: false },
-                LocalConfirm { accept: true },
-            ],
-        ] {
-            let mut state = pending_out();
-            for event in order {
-                let action = advance_pairing(&state, event);
-                assert!(!action.pin);
-                state = action.next;
-            }
-        }
-    }
-
-    #[test]
     fn el_par_guardado_que_coincide_con_el_certificado_es_consistente() {
         let fp = fingerprint_from_der(b"cert");
         assert!(identity_pair_matches(Some(&fp), b"cert"));
@@ -1227,16 +1351,6 @@ mod tests {
         // reemplaza aunque el conteo pase el cupo reducido.
         assert_eq!(admit_session(false, 24, 32), SessionAdmission::Admit);
         assert_eq!(admit_session(true, 24, reduced), SessionAdmission::Replace);
-    }
-
-    #[test]
-    fn el_codigo_entrante_correcto_no_fija_el_valor_de_un_algoritmo_viejo() {
-        // Sólo se compara contra el recalculado: sea cual sea el algoritmo.
-        let code = verification_code("11:22:33:44", "AA:BB:CC:DD");
-        assert_eq!(
-            checked_incoming_code("AA:BB:CC:DD", "11:22:33:44", &code),
-            Some(code)
-        );
     }
 
     #[test]

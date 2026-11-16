@@ -1854,20 +1854,24 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vasak-connect-daemon"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "bytes",
  "dirs",
+ "hex",
+ "hkdf",
  "libc",
  "mdns-sd",
  "oo7",
  "proptest",
  "rcgen",
+ "ring",
  "rustls",
  "rustls-pki-types",
  "serde",
  "serde_json",
  "sha2",
+ "subtle",
  "tokio",
  "tokio-rustls",
  "tokio-stream",
@@ -1882,11 +1886,10 @@ dependencies = [
 
 [[package]]
 name = "vasak-connect-protocol"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "serde",
  "serde_json",
- "sha2",
  "zbus",
 ]
 

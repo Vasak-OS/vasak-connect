@@ -21,6 +21,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use ring::agreement;
+use ring::rand::SystemRandom;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::time::{interval, timeout};
@@ -35,10 +37,9 @@ use vasak_connect_protocol::wire::{
 use crate::{notify, State};
 use identity::Identity;
 use pure::{
-    admit_session, advance_pairing, checked_incoming_code, device_id_from_fingerprint,
-    evaluate_peer_cert, keepalive_exhausted, mdns_instance_label, owns_session_slot,
-    parse_peer_txt, self_name, verification_code, PairingEvent, PairingState, SessionAdmission,
-    TrustDecision,
+    admit_session, advance_pairing, derive_sas, device_id_from_fingerprint, evaluate_peer_cert,
+    keepalive_exhausted, mdns_instance_label, owns_session_slot, parse_peer_txt, sas_commitment,
+    self_name, PairingEvent, PairingState, SessionAdmission, TrustDecision,
 };
 use transport::{peer_fingerprint, read_frame, write_frame, MessageDecoder, SessionError};
 
@@ -111,6 +112,13 @@ pub struct Session {
     /// [`advance_pairing`]: fijar al par depende de este estado, no de un mensaje
     /// suelto que mande el par.
     pair: PairingState,
+    /// La clave DH efímera propia de este pareo (RFC 6189), generada al iniciar o
+    /// al recibir el `PairRequest`. Se **consume** (`take`) al computar el secreto
+    /// compartido, así no se reusa; `None` fuera de un pareo en curso.
+    dh_secret: Option<agreement::EphemeralPrivateKey>,
+    /// Nuestra clave pública DH en bytes crudos, para revelarla y para derivar el
+    /// SAS con el orden canónico. Vacía fuera de un pareo en curso.
+    dh_public: Vec<u8>,
     /// Id único de esta sesión. Distingue una sesión de su reemplazo para que la
     /// limpieza de la vieja no borre la entrada de la nueva.
     session_id: u64,
@@ -386,10 +394,10 @@ pub async fn run(connection: zbus::Connection, state: Arc<Mutex<State>>) {
                                 .map(|s| (s.fingerprint.clone(), s.name.clone()))
                         };
                         if let Some((peer_fp, peer_name)) = session_peer {
-                            let code = verification_code(&identity.fingerprint, &peer_fp);
-                            if let Some(action) =
-                                step_pairing(&state, &device_id, PairingEvent::LocalInitiate { code }).await
-                            {
+                            // Genera la clave DH efímera, se compromete a ella y manda
+                            // el `PairRequest`. El SAS se mostrará recién al recibir la
+                            // clave del par.
+                            if let Some(action) = begin_initiate(&state, &device_id).await {
                                 apply_pairing_over_outbound(
                                     action, &device_id, &peer_name, &peer_fp, &state, &connection,
                                 )
@@ -585,6 +593,8 @@ async fn handle_session<S>(
                 fingerprint: fingerprint.clone(),
                 paired,
                 pair: PairingState::Idle,
+                dh_secret: None,
+                dh_public: Vec::new(),
                 session_id,
                 battery: None,
                 outbound: out_tx,
@@ -594,13 +604,11 @@ async fn handle_session<S>(
     emit_peer_changed(&connection).await;
     info!(%device_id, paired, "sesión del canal abierta");
 
-    // Si somos nosotros los que iniciamos el pareo, pedirlo ahora: la máquina de
-    // pareo decide qué mandar y qué mostrarle a la persona.
+    // Si somos nosotros los que iniciamos el pareo, pedirlo ahora: se genera la
+    // clave DH efímera, se manda el compromiso, y el SAS se muestra al recibir la
+    // clave del par.
     if initiate_pair && !paired {
-        let code = verification_code(&own.fingerprint, &fingerprint);
-        if let Some(action) =
-            step_pairing(&state, &device_id, PairingEvent::LocalInitiate { code }).await
-        {
+        if let Some(action) = begin_initiate(&state, &device_id).await {
             apply_pairing_over_writer(
                 action,
                 &device_id,
@@ -733,7 +741,8 @@ where
 /// Procesa un mensaje entrante. Devuelve `false` si la sesión debe cerrarse.
 ///
 /// `own_fingerprint` es la huella propia y `fingerprint` la del par en esta
-/// sesión; con las dos se recalcula localmente el código del pareo entrante.
+/// sesión; con las dos se deriva el SAS del pareo, atándolo a los dos
+/// certificados que se van a fijar.
 // Son muchos parámetros, pero cada uno es un dato distinto que el despacho de un
 // mensaje necesita (quién, con qué huellas, por dónde contestar y a dónde emitir);
 // juntarlos en una estructura sólo para la cuenta no lo haría más claro.
@@ -756,36 +765,13 @@ where
         // El `Pong` lo mira el bucle de la sesión (pone a cero el keepalive); si
         // llega acá, no hay nada que hacer.
         Message::Pong => true,
-        Message::PairRequest { verification } => {
-            // El código se **recalcula localmente** con las dos huellas: el que
-            // manda el par no se muestra ni se cree. Si no coincide con el local, el
-            // pareo se ignora —es la señal de un intermediario en el primer pareo—.
-            let Some(code) = checked_incoming_code(own_fingerprint, fingerprint, &verification)
-            else {
-                debug!(%device_id, "código de pareo entrante no coincide con el recalculado: se ignora");
-                return true;
-            };
-
-            // El par quiere parear. La máquina decide (estado `IncomingPending`,
-            // mostrar el código); **no se fija nada** hasta la confirmación local.
-            if let Some(action) = step_pairing(
-                state,
-                device_id,
-                PairingEvent::PeerRequest { code: code.clone() },
-            )
-            .await
-            {
-                // El aviso del sistema es sólo para un pedido entrante nuevo, y con
-                // el código recalculado localmente.
-                if action.notify_code.is_some() {
-                    notify::send(
-                        connection,
-                        &format!("{} quiere conectarse", peer.name),
-                        &format!("Confirmá el código {code} para parear."),
-                        notify::PHONE_ICON,
-                    )
-                    .await;
-                }
+        Message::PairRequest { commitment } => {
+            // El par pide parear y se compromete a su clave DH. Somos el
+            // respondedor: generamos la nuestra, la revelamos (`PairDh`) y
+            // guardamos el compromiso para verificarlo al llegar el `PairReveal`.
+            // No se muestra SAS todavía: falta nuestro cómputo del secreto
+            // compartido.
+            if let Some(action) = begin_respond(state, device_id, commitment).await {
                 apply_pairing_over_writer(
                     action,
                     device_id,
@@ -797,6 +783,67 @@ where
                 )
                 .await;
             }
+            true
+        }
+        Message::PairDh { dh_pub } => {
+            // Somos el iniciador: el par reveló su clave DH. Computamos el secreto
+            // compartido con la nuestra, derivamos el SAS y revelamos nuestra clave.
+            match advance_on_peer_dh(state, device_id, own_fingerprint, fingerprint, &dh_pub).await
+            {
+                Some(action) => {
+                    apply_pairing_over_writer(
+                        action,
+                        device_id,
+                        &peer.name,
+                        fingerprint,
+                        writer,
+                        state,
+                        connection,
+                    )
+                    .await;
+                }
+                None => {
+                    debug!(%device_id, "DH del par inválido o sin pareo saliente en curso: se ignora");
+                }
+            }
+            true
+        }
+        Message::PairReveal { dh_pub } => {
+            // Somos el respondedor: el par reveló su clave. La máquina verifica que
+            // su hash coincida con el compromiso en tiempo constante; si no, es un
+            // intermediario y se aborta cerrando la sesión.
+            let Some(action) =
+                advance_on_peer_reveal(state, device_id, own_fingerprint, fingerprint, &dh_pub)
+                    .await
+            else {
+                debug!(%device_id, "reveal del par inválido o sin pareo entrante en curso: se ignora");
+                return true;
+            };
+            if action.abort {
+                warn!(%device_id, "el reveal del par no coincide con el compromiso: se aborta el pareo");
+                return false;
+            }
+            // El aviso del sistema es para el pedido entrante, ya con el SAS
+            // derivado. La señal de D-Bus la emite `apply_pairing_over_writer`.
+            if let Some(code) = action.notify_code.clone() {
+                notify::send(
+                    connection,
+                    &format!("{} quiere conectarse", peer.name),
+                    &format!("Confirmá el código {code} para parear."),
+                    notify::PHONE_ICON,
+                )
+                .await;
+            }
+            apply_pairing_over_writer(
+                action,
+                device_id,
+                &peer.name,
+                fingerprint,
+                writer,
+                state,
+                connection,
+            )
+            .await;
             true
         }
         Message::PairResponse { accepted } => {
@@ -858,10 +905,10 @@ where
             }
             true
         }
-        // La transferencia de archivos es de un PR posterior, y recién después de
-        // que aterrice el SAS con compromiso (RFC 6189): hasta entonces un mal
-        // pareo en la primera vez podría exponer los bytes. Ver `wire.rs`. Por
-        // ahora se reconoce y se ignora sin cerrar la sesión.
+        // La transferencia de archivos es de un PR posterior. El SAS con
+        // compromiso (RFC 6189) ya protege el primer pareo; falta sólo la
+        // transferencia en sí. Por ahora se reconoce y se ignora sin cerrar la
+        // sesión.
         Message::FileOffer(_) | Message::FileResult { .. } => {
             debug!(%device_id, "transferencia de archivos aún no implementada; se ignora");
             true
@@ -910,6 +957,159 @@ async fn step_pairing(
     let ch = guard.channel.as_mut()?;
     let session = ch.sessions.get_mut(device_id)?;
     let action = advance_pairing(&session.pair, event);
+    session.pair = action.next.clone();
+    Some(action)
+}
+
+/// Genera un par DH efímero X25519: la clave privada y su pública en bytes
+/// crudos. `None` si el generador del sistema falla, en cuyo caso el pareo no
+/// arranca (mejor que parear sin el compromiso).
+fn generate_ephemeral() -> Option<(agreement::EphemeralPrivateKey, Vec<u8>)> {
+    let rng = SystemRandom::new();
+    let secret = agreement::EphemeralPrivateKey::generate(&agreement::X25519, &rng).ok()?;
+    let public = secret.compute_public_key().ok()?;
+    Some((secret, public.as_ref().to_vec()))
+}
+
+/// Computa el secreto compartido X25519 con la clave privada propia (que se
+/// consume) y la pública del par. `None` si la pública del par es inválida.
+fn compute_shared(secret: agreement::EphemeralPrivateKey, peer_public: &[u8]) -> Option<Vec<u8>> {
+    agreement::agree_ephemeral(
+        secret,
+        &agreement::UnparsedPublicKey::new(&agreement::X25519, peer_public),
+        |shared| shared.to_vec(),
+    )
+    .ok()
+}
+
+/// Inicia el pareo (somos el iniciador): genera la clave DH efímera, se
+/// compromete a ella y hace avanzar la máquina con `LocalInitiate`. Sólo actúa si
+/// la sesión no tenía un pareo en curso; si no, `None` y no se toca el material
+/// DH. No hay `.await` tras tomar el candado, así que generar la clave con el
+/// candado puesto no bloquea el runtime.
+async fn begin_initiate(state: &Arc<Mutex<State>>, device_id: &str) -> Option<pure::PairingAction> {
+    let mut guard = state.lock().await;
+    let ch = guard.channel.as_mut()?;
+    let session = ch.sessions.get_mut(device_id)?;
+    if !matches!(session.pair, PairingState::Idle) {
+        return None;
+    }
+    let (secret, public) = generate_ephemeral()?;
+    let commitment = sas_commitment(&public);
+    session.dh_secret = Some(secret);
+    session.dh_public = public;
+    let action = advance_pairing(&session.pair, PairingEvent::LocalInitiate { commitment });
+    session.pair = action.next.clone();
+    Some(action)
+}
+
+/// Responde a un `PairRequest` (somos el respondedor): guarda el compromiso del
+/// par, genera nuestra clave DH efímera y hace avanzar la máquina con
+/// `PeerRequest`, que manda el `PairDh`. Sólo actúa desde reposo; un `PairRequest`
+/// repetido en medio de un pareo se ignora sin regenerar la clave.
+async fn begin_respond(
+    state: &Arc<Mutex<State>>,
+    device_id: &str,
+    commitment: String,
+) -> Option<pure::PairingAction> {
+    let mut guard = state.lock().await;
+    let ch = guard.channel.as_mut()?;
+    let session = ch.sessions.get_mut(device_id)?;
+    if !matches!(session.pair, PairingState::Idle) {
+        return None;
+    }
+    let (secret, public) = generate_ephemeral()?;
+    let own_dh_pub = hex::encode(&public);
+    session.dh_secret = Some(secret);
+    session.dh_public = public;
+    let action = advance_pairing(
+        &session.pair,
+        PairingEvent::PeerRequest {
+            commitment,
+            own_dh_pub,
+        },
+    );
+    session.pair = action.next.clone();
+    Some(action)
+}
+
+/// Procesa el `PairDh` del par (somos el iniciador): computa el secreto
+/// compartido con nuestra clave, deriva el SAS con el orden canónico (iniciador
+/// primero) y hace avanzar la máquina revelando nuestra clave. `None` si no
+/// estábamos esperando el DH o si la clave del par es inválida.
+async fn advance_on_peer_dh(
+    state: &Arc<Mutex<State>>,
+    device_id: &str,
+    own_fingerprint: &str,
+    peer_fingerprint: &str,
+    peer_dh_hex: &str,
+) -> Option<pure::PairingAction> {
+    let mut guard = state.lock().await;
+    let ch = guard.channel.as_mut()?;
+    let session = ch.sessions.get_mut(device_id)?;
+    if !matches!(session.pair, PairingState::OutgoingCommitted) {
+        return None;
+    }
+    let peer_public = hex::decode(peer_dh_hex).ok()?;
+    let secret = session.dh_secret.take()?;
+    let own_public = session.dh_public.clone();
+    let shared = compute_shared(secret, &peer_public)?;
+    // Iniciador: nuestra clave es `init_pub`, la del par `resp_pub`.
+    let sas = derive_sas(
+        &shared,
+        &own_public,
+        &peer_public,
+        own_fingerprint,
+        peer_fingerprint,
+    );
+    let action = advance_pairing(
+        &session.pair,
+        PairingEvent::PeerDh {
+            reveal: hex::encode(&own_public),
+            sas,
+        },
+    );
+    session.pair = action.next.clone();
+    Some(action)
+}
+
+/// Procesa el `PairReveal` del par (somos el respondedor): computa el secreto
+/// compartido, deriva el mismo SAS (iniciador = el par) y hace avanzar la
+/// máquina, que verifica el compromiso contra la clave revelada. `None` si no
+/// estábamos esperando el reveal o si la clave del par es inválida; una acción
+/// con `abort` si el compromiso no coincide.
+async fn advance_on_peer_reveal(
+    state: &Arc<Mutex<State>>,
+    device_id: &str,
+    own_fingerprint: &str,
+    peer_fingerprint: &str,
+    peer_dh_hex: &str,
+) -> Option<pure::PairingAction> {
+    let mut guard = state.lock().await;
+    let ch = guard.channel.as_mut()?;
+    let session = ch.sessions.get_mut(device_id)?;
+    if !matches!(session.pair, PairingState::IncomingCommitted { .. }) {
+        return None;
+    }
+    let peer_public = hex::decode(peer_dh_hex).ok()?;
+    let secret = session.dh_secret.take()?;
+    let own_public = session.dh_public.clone();
+    let shared = compute_shared(secret, &peer_public)?;
+    // Respondedor: la clave del par es `init_pub`, la nuestra `resp_pub`.
+    let sas = derive_sas(
+        &shared,
+        &peer_public,
+        &own_public,
+        peer_fingerprint,
+        own_fingerprint,
+    );
+    let action = advance_pairing(
+        &session.pair,
+        PairingEvent::PeerReveal {
+            revealed: peer_public,
+            sas,
+        },
+    );
     session.pair = action.next.clone();
     Some(action)
 }
@@ -1332,6 +1532,8 @@ mod tests {
             fingerprint: String::new(),
             paired,
             pair: PairingState::default(),
+            dh_secret: None,
+            dh_public: Vec::new(),
             session_id,
             battery: None,
             outbound,

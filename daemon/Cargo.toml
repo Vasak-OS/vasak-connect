@@ -28,6 +28,15 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # La identidad TLS: certificado autofirmado (rcgen) y su huella (sha2).
 rcgen = "0.14"
 sha2 = "0.10"
+# SAS con compromiso del pareo (RFC 6189). Ninguna es nueva en el grafo: `ring`
+# ya viene como proveedor cripto de rustls, y `subtle`/`hkdf`/`hex` ya estaban
+# como dependencias transitivas. Acá se usan directo: `ring::agreement` para el
+# DH efímero X25519, `subtle` para comparar el commitment en tiempo constante,
+# `hkdf` para derivar el SAS y `hex` para el compromiso y las claves en el cable.
+ring = "0.17"
+subtle = "2"
+hkdf = "0.12"
+hex = "0.4"
 # TLS mutuo con el proveedor `ring`, no el de por omisión (`aws-lc-rs`): ring no
 # pide `cmake` para compilar y alcanza para lo que el canal usa. Se elige el
 # proveedor a mano en el código, así que no hace falta instalar uno global.
