@@ -337,6 +337,19 @@ impl ConnectService {
             .map_err(FdoError::Failed)
     }
 
+    /// La última batería conocida de un par: `(conocida, nivel 0–100, cargando)`.
+    /// `conocida` es `false` si el par nunca la informó en esta sesión.
+    async fn peer_battery(&self, device_id: &str) -> (bool, u8, bool) {
+        channel::peer_battery(&self.state, device_id).await
+    }
+
+    /// Manda el texto copiado en el escritorio a cada par pareado y conectado.
+    /// Devuelve a cuántos llegó. Lo llama el escritorio cuando cambia el
+    /// portapapeles local.
+    async fn send_clipboard(&self, text: &str) -> u32 {
+        channel::send_clipboard(&self.state, text).await
+    }
+
     /// The cameras on a device.
     ///
     /// Cached: the phone has to walk every sensor mode to answer, which takes
@@ -512,6 +525,19 @@ impl ConnectService {
         name: &str,
         verification: &str,
     ) -> zbus::Result<()>;
+
+    /// Un par informó su batería. `level` ya viene recortado a 0–100.
+    #[zbus(signal)]
+    async fn peer_battery_changed(
+        emitter: &SignalEmitter<'_>,
+        device_id: &str,
+        level: u8,
+        charging: bool,
+    ) -> zbus::Result<()>;
+
+    /// Un par pareado copió texto; el escritorio lo aplica al portapapeles local.
+    #[zbus(signal)]
+    async fn clipboard_received(emitter: &SignalEmitter<'_>, text: &str) -> zbus::Result<()>;
 }
 
 pub(crate) fn now_iso8601() -> String {

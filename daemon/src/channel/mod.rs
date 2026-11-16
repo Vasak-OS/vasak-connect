@@ -28,7 +28,9 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tokio_stream::StreamExt;
 use tokio_util::codec::FramedRead;
 use tracing::{debug, info, warn};
-use vasak_connect_protocol::wire::{DeviceKind, Message, PeerInfo, PROTOCOL_VERSION};
+use vasak_connect_protocol::wire::{
+    BatteryStatus, DeviceKind, Message, PeerInfo, PROTOCOL_VERSION,
+};
 
 use crate::{notify, State};
 use identity::Identity;
@@ -112,6 +114,10 @@ pub struct Session {
     /// Id único de esta sesión. Distingue una sesión de su reemplazo para que la
     /// limpieza de la vieja no borre la entrada de la nueva.
     session_id: u64,
+    /// Última batería que empujó el par, ya recortada a 0–100. `None` hasta el
+    /// primer empuje. Deja que la pantalla de ajustes la consulte sin esperar al
+    /// próximo evento.
+    battery: Option<BatteryStatus>,
     outbound: mpsc::UnboundedSender<Outbound>,
 }
 
@@ -189,6 +195,22 @@ impl ChannelRuntime {
             Some(session) => session.outbound.send(Outbound::Send(message)).is_ok(),
             None => false,
         }
+    }
+
+    /// Manda un mensaje a cada par pareado y conectado. Devuelve a cuántos llegó.
+    /// Es el camino del portapapeles saliente: lo que se copió en el escritorio va
+    /// a los teléfonos de confianza, nunca a uno sin parear ni sólo descubierto.
+    fn broadcast_paired(&self, message: Message) -> u32 {
+        self.sessions
+            .values()
+            .filter(|session| session.paired)
+            .filter(|session| {
+                session
+                    .outbound
+                    .send(Outbound::Send(message.clone()))
+                    .is_ok()
+            })
+            .count() as u32
     }
 
     /// Cierra una sesión abierta, si existe.
@@ -564,6 +586,7 @@ async fn handle_session<S>(
                 paired,
                 pair: PairingState::Idle,
                 session_id,
+                battery: None,
                 outbound: out_tx,
             },
         );
@@ -815,12 +838,61 @@ where
             info!(%device_id, "el par deshizo el pareo");
             true
         }
-        // El resto (batería, portapapeles, archivos) es de un PR posterior; por
-        // ahora se reconoce y se ignora sin cerrar la sesión.
-        other => {
-            debug!(%device_id, ?other, "mensaje aún no manejado");
+        Message::Battery(raw) => {
+            // Sólo de un par pareado, y con el nivel recortado a 0–100: la decisión
+            // de confianza y el saneo están en [`pure::sanitize_incoming_battery`].
+            let paired = session_paired(state, device_id).await;
+            if let Some(status) = pure::sanitize_incoming_battery(paired, raw) {
+                set_session_battery(state, device_id, status).await;
+                emit_peer_battery(connection, device_id, status).await;
+            }
             true
         }
+        Message::Clipboard { text } => {
+            // Sólo de un par pareado: escribir en el portapapeles local desde un
+            // aparato sin parear es una inyección. El escritorio aplica el texto al
+            // recibir la señal; el daemon no toca Wayland.
+            let paired = session_paired(state, device_id).await;
+            if let Some(text) = pure::accept_incoming_clipboard(paired, text) {
+                emit_clipboard_received(connection, &text).await;
+            }
+            true
+        }
+        // La transferencia de archivos es de un PR posterior, y recién después de
+        // que aterrice el SAS con compromiso (RFC 6189): hasta entonces un mal
+        // pareo en la primera vez podría exponer los bytes. Ver `wire.rs`. Por
+        // ahora se reconoce y se ignora sin cerrar la sesión.
+        Message::FileOffer(_) | Message::FileResult { .. } => {
+            debug!(%device_id, "transferencia de archivos aún no implementada; se ignora");
+            true
+        }
+        // Un segundo `Hello` en la misma sesión no tiene sentido (ya se consumió en
+        // el handshake); se ignora sin cerrar.
+        Message::Hello(_) => true,
+    }
+}
+
+/// Si la sesión con ese par está pareada ahora. Es la puerta de confianza para el
+/// estado que empuja el par (batería, portapapeles).
+async fn session_paired(state: &Arc<Mutex<State>>, device_id: &str) -> bool {
+    let guard = state.lock().await;
+    guard
+        .channel
+        .as_ref()
+        .and_then(|ch| ch.sessions.get(device_id))
+        .is_some_and(|session| session.paired)
+}
+
+/// Guarda la última batería que empujó el par, para que la consulta `peer_battery`
+/// la devuelva sin esperar al próximo evento.
+async fn set_session_battery(state: &Arc<Mutex<State>>, device_id: &str, status: BatteryStatus) {
+    let mut guard = state.lock().await;
+    if let Some(session) = guard
+        .channel
+        .as_mut()
+        .and_then(|ch| ch.sessions.get_mut(device_id))
+    {
+        session.battery = Some(status);
     }
 }
 
@@ -1186,4 +1258,124 @@ async fn emit_pairing_requested(
         return;
     };
     let _ = crate::ConnectService::pairing_requested(&emitter, device_id, name, code).await;
+}
+
+/// Emite la señal de que un par informó su batería. El panel y los ajustes la
+/// pintan contra `device_id`.
+async fn emit_peer_battery(connection: &zbus::Connection, device_id: &str, status: BatteryStatus) {
+    let Ok(emitter) =
+        zbus::object_server::SignalEmitter::new(connection, vasak_connect_protocol::SERVICE_PATH)
+    else {
+        return;
+    };
+    let _ = crate::ConnectService::peer_battery_changed(
+        &emitter,
+        device_id,
+        status.level,
+        status.charging,
+    )
+    .await;
+}
+
+/// Emite la señal de texto de portapapeles recibido. El escritorio decide
+/// aplicarlo al portapapeles de Wayland; el daemon no lo toca.
+async fn emit_clipboard_received(connection: &zbus::Connection, text: &str) {
+    let Ok(emitter) =
+        zbus::object_server::SignalEmitter::new(connection, vasak_connect_protocol::SERVICE_PATH)
+    else {
+        return;
+    };
+    let _ = crate::ConnectService::clipboard_received(&emitter, text).await;
+}
+
+/// Manda el texto copiado en el escritorio a cada par pareado y conectado.
+/// Devuelve a cuántos llegó. Lo llama el escritorio por D-Bus cuando cambia el
+/// portapapeles local.
+pub async fn send_clipboard(state: &Arc<Mutex<State>>, text: &str) -> u32 {
+    if text.is_empty() {
+        return 0;
+    }
+    let guard = state.lock().await;
+    match guard.channel.as_ref() {
+        Some(ch) => ch.broadcast_paired(Message::Clipboard {
+            text: text.to_string(),
+        }),
+        None => 0,
+    }
+}
+
+/// La última batería conocida de un par: `(conocida, nivel, cargando)`. `conocida`
+/// es `false` si el par nunca empujó su batería en esta sesión.
+pub async fn peer_battery(state: &Arc<Mutex<State>>, device_id: &str) -> (bool, u8, bool) {
+    let guard = state.lock().await;
+    match guard
+        .channel
+        .as_ref()
+        .and_then(|ch| ch.sessions.get(device_id))
+        .and_then(|session| session.battery)
+    {
+        Some(status) => (true, status.level, status.charging),
+        None => (false, 0, false),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+
+    fn session(paired: bool, session_id: u64) -> (Session, mpsc::UnboundedReceiver<Outbound>) {
+        let (outbound, rx) = mpsc::unbounded_channel();
+        let session = Session {
+            name: "Pixel 8".into(),
+            kind: DeviceKind::Phone,
+            fingerprint: String::new(),
+            paired,
+            pair: PairingState::default(),
+            session_id,
+            battery: None,
+            outbound,
+        };
+        (session, rx)
+    }
+
+    fn runtime(sessions: Vec<(&str, Session)>) -> ChannelRuntime {
+        let (commands, _) = mpsc::unbounded_channel();
+        ChannelRuntime {
+            identity: Arc::new(Identity {
+                cert_der: CertificateDer::from(Vec::new()),
+                key_der: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(Vec::new())),
+                fingerprint: String::new(),
+                device_id: "yo".into(),
+            }),
+            name: "Escritorio".into(),
+            discovered: HashMap::new(),
+            sessions: sessions
+                .into_iter()
+                .map(|(id, s)| (id.to_string(), s))
+                .collect(),
+            commands,
+        }
+    }
+
+    #[test]
+    fn el_portapapeles_saliente_llega_solo_a_los_pares_pareados() {
+        let (paired, mut paired_rx) = session(true, 1);
+        let (unpaired, mut unpaired_rx) = session(false, 2);
+        let rt = runtime(vec![("pareado", paired), ("sin-parear", unpaired)]);
+        let msg = Message::Clipboard {
+            text: "secreto".into(),
+        };
+
+        assert_eq!(rt.broadcast_paired(msg.clone()), 1);
+
+        match paired_rx.try_recv() {
+            Ok(Outbound::Send(got)) => assert_eq!(got, msg),
+            _ => panic!("el par pareado debía recibir el mensaje"),
+        }
+        assert!(
+            unpaired_rx.try_recv().is_err(),
+            "el par sin parear no debe recibir nada"
+        );
+    }
 }
