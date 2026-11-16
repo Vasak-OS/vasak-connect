@@ -369,6 +369,13 @@ mod tests {
     }
 
     #[test]
+    fn el_codigo_es_el_sha256_truncado_de_las_huellas_ordenadas() {
+        // Vector calculado aparte: SHA-256("11:22:33:44:AA:BB:CC:DD"), primeros
+        // ocho bytes como u64 big-endian, módulo un millón.
+        assert_eq!(verification_code("AA:BB:CC:DD", "11:22:33:44"), "506230");
+    }
+
+    #[test]
     fn el_codigo_cambia_si_cambia_una_huella() {
         let base = verification_code("AA:BB", "CC:DD");
         assert_ne!(base, verification_code("AA:BC", "CC:DD"));

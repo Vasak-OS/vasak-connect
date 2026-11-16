@@ -923,7 +923,7 @@ mod tests {
     #[test]
     fn confirmar_un_pedido_saliente_antes_de_la_respuesta_no_fija_todavia() {
         // Confirmación local antes de que el par conteste: se anota y se espera,
-        // no se fija. qa amplía: los dos órdenes y el rechazo tardío.
+        // no se fija.
         let action = advance_pairing(&pending_out(), PairingEvent::LocalConfirm { accept: true });
         assert!(!action.pin);
         assert_eq!(
@@ -1058,6 +1058,153 @@ mod tests {
         assert_eq!(
             checked_incoming_code("AA:BB", "CC:DD", &format!(" {real} ")),
             None
+        );
+    }
+
+    fn outgoing_confirmed() -> PairingState {
+        PairingState::OutgoingConfirmed {
+            code: "123456".into(),
+        }
+    }
+
+    #[test]
+    fn confirmar_y_despues_aceptar_el_par_fija() {
+        let confirmed =
+            advance_pairing(&pending_out(), PairingEvent::LocalConfirm { accept: true });
+        assert!(!confirmed.pin);
+        let accepted = advance_pairing(
+            &confirmed.next,
+            PairingEvent::PeerResponse { accepted: true },
+        );
+        assert!(accepted.pin);
+        assert_eq!(accepted.next, PairingState::Idle);
+    }
+
+    #[test]
+    fn aceptar_el_par_y_despues_confirmar_fija() {
+        let accepted = advance_pairing(
+            &pending_out(),
+            PairingEvent::PeerResponse { accepted: true },
+        );
+        assert!(!accepted.pin);
+        let confirmed =
+            advance_pairing(&accepted.next, PairingEvent::LocalConfirm { accept: true });
+        assert!(confirmed.pin);
+        assert_eq!(confirmed.next, PairingState::Idle);
+    }
+
+    #[test]
+    fn el_rechazo_tardio_del_par_cancela_sin_fijar() {
+        let action = advance_pairing(
+            &outgoing_confirmed(),
+            PairingEvent::PeerResponse { accepted: false },
+        );
+        assert!(!action.pin);
+        assert_eq!(action.next, PairingState::Idle);
+    }
+
+    #[test]
+    fn arrepentirse_tras_confirmar_cancela_sin_fijar() {
+        let action = advance_pairing(
+            &outgoing_confirmed(),
+            PairingEvent::LocalConfirm { accept: false },
+        );
+        assert!(!action.pin);
+        assert_eq!(action.next, PairingState::Idle);
+    }
+
+    #[test]
+    fn el_pareo_saliente_solo_fija_cuando_ambos_aceptaron_en_cualquier_orden() {
+        use PairingEvent::{LocalConfirm, PeerResponse};
+        let orders = [
+            [
+                LocalConfirm { accept: true },
+                PeerResponse { accepted: true },
+            ],
+            [
+                PeerResponse { accepted: true },
+                LocalConfirm { accept: true },
+            ],
+        ];
+        for order in orders {
+            let mut state = pending_out();
+            let mut pins = Vec::new();
+            for event in order {
+                let action = advance_pairing(&state, event);
+                pins.push(action.pin);
+                state = action.next;
+            }
+            assert_eq!(pins, [false, true]);
+        }
+        // Con un rechazo en cualquier punto nunca se fija.
+        for order in [
+            [
+                LocalConfirm { accept: true },
+                PeerResponse { accepted: false },
+            ],
+            [
+                PeerResponse { accepted: false },
+                LocalConfirm { accept: true },
+            ],
+        ] {
+            let mut state = pending_out();
+            for event in order {
+                let action = advance_pairing(&state, event);
+                assert!(!action.pin);
+                state = action.next;
+            }
+        }
+    }
+
+    #[test]
+    fn el_par_guardado_que_coincide_con_el_certificado_es_consistente() {
+        let fp = fingerprint_from_der(b"cert");
+        assert!(identity_pair_matches(Some(&fp), b"cert"));
+        assert!(identity_pair_matches(Some(&fp.to_lowercase()), b"cert"));
+    }
+
+    #[test]
+    fn un_par_desparejo_o_sin_huella_obliga_a_regenerar() {
+        let otra = fingerprint_from_der(b"otro cert");
+        assert!(!identity_pair_matches(Some(&otra), b"cert"));
+        assert!(!identity_pair_matches(None, b"cert"));
+    }
+
+    #[test]
+    fn la_etiqueta_mdns_se_recorta_por_caracteres_y_no_entra_en_panico() {
+        // 39 ASCII + una `é` de dos bytes: el byte 40 cae a mitad de carácter.
+        let id = format!("{}{}", "a".repeat(39), "éxyz");
+        let label = mdns_instance_label(&id);
+        assert_eq!(label.chars().count(), 40);
+        assert!(label.ends_with('é'));
+        assert!(!label.contains('x'));
+        // Un id corto queda igual; uno largo de ASCII se recorta a 40.
+        assert_eq!(mdns_instance_label("abc"), "abc");
+        assert_eq!(mdns_instance_label(&"f".repeat(64)), "f".repeat(40));
+        // Todo multibyte: 40 caracteres, 80 bytes, sin partir ninguno.
+        assert_eq!(mdns_instance_label(&"ñ".repeat(50)), "ñ".repeat(40));
+    }
+
+    #[test]
+    fn el_cupo_reducido_corta_a_los_nuevos_sin_parear_pero_no_a_los_existentes() {
+        // `effective_max` = MAX - reserva para los de confianza (8 de 32, p.ej.).
+        let reduced = 24;
+        assert_eq!(admit_session(false, 23, reduced), SessionAdmission::Admit);
+        assert_eq!(admit_session(false, 24, reduced), SessionAdmission::Reject);
+        assert_eq!(admit_session(false, 30, reduced), SessionAdmission::Reject);
+        // Un par pareado que usa el cupo completo todavía entra, y uno con slot
+        // reemplaza aunque el conteo pase el cupo reducido.
+        assert_eq!(admit_session(false, 24, 32), SessionAdmission::Admit);
+        assert_eq!(admit_session(true, 24, reduced), SessionAdmission::Replace);
+    }
+
+    #[test]
+    fn el_codigo_entrante_correcto_no_fija_el_valor_de_un_algoritmo_viejo() {
+        // Sólo se compara contra el recalculado: sea cual sea el algoritmo.
+        let code = verification_code("11:22:33:44", "AA:BB:CC:DD");
+        assert_eq!(
+            checked_incoming_code("AA:BB:CC:DD", "11:22:33:44", &code),
+            Some(code)
         );
     }
 }
