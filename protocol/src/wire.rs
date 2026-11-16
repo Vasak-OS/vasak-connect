@@ -5,8 +5,9 @@
 //! máquina, y por eso usa `zbus`. Esto es otra cosa: viaja por la red, entre
 //! dos aparatos, y lo tiene que entender también la app móvil —que vive en otro
 //! repositorio y no puede depender de `zbus`—. Por eso el módulo es
-//! deliberadamente pobre en dependencias: `serde`, `serde_json` y `sha2` (para el
-//! código de verificación del pareo), nada que no compile en Android o iOS.
+//! deliberadamente pobre en dependencias: `serde` y `serde_json`, nada que no
+//! compile en Android o iOS. El cálculo del SAS (compromiso DH, derivación) vive
+//! del lado del daemon; acá sólo viaja la forma de los mensajes.
 //!
 //! El modelo copia el de KDE Connect porque está probado: cada aparato tiene
 //! una identidad de larga vida (un certificado autofirmado), el descubrimiento
@@ -15,12 +16,16 @@
 //! certificado; lo de este archivo es sólo la forma de los mensajes.
 
 use serde::{Deserialize, Serialize};
-use sha2::Digest;
 
 /// Versión del protocolo de red. Se anuncia en el descubrimiento y se manda en
 /// [`Message::Hello`]; dos puntas con versiones incompatibles se descartan antes
 /// de intentar parear, en vez de fallar a mitad de una conversación.
-pub const PROTOCOL_VERSION: u16 = 1;
+///
+/// La versión 2 trae el SAS con compromiso (RFC 6189): el pareo dejó de mandar
+/// un código derivado de las huellas y pasó a un intercambio Diffie-Hellman
+/// efímero con compromiso. Una punta con la versión 1 se rechaza limpio en el
+/// `Hello` en vez de hablar un pareo que ya no existe.
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// El tipo de servicio DNS-SD que el daemon publica y la app busca.
 ///
@@ -137,13 +142,27 @@ pub struct FileOffer {
 pub enum Message {
     /// Primer mensaje de cada punta: quién soy.
     Hello(PeerInfo),
-    /// Pedido de pareo. `verification` es el código corto que las dos pantallas
-    /// muestran para que la persona confirme que está pareando con el aparato
-    /// que tiene enfrente y no con un intermediario.
+    /// Pedido de pareo (lo manda el iniciador). `commitment` es
+    /// `hex(SHA-256(A))`, el compromiso a la clave DH efímera `A` del iniciador,
+    /// que **no** se revela todavía. Comprometerse antes de ver la clave del par
+    /// es lo que impide grindear el SAS offline (RFC 6189).
     PairRequest {
-        verification: String,
+        commitment: String,
     },
-    /// Respuesta al pedido de pareo.
+    /// Respuesta del respondedor al `PairRequest`: revela su clave DH efímera
+    /// `B` en `hex(B)`. Como el respondedor todavía no vio `A`, revelarla acá no
+    /// le da nada que grindear al iniciador.
+    PairDh {
+        dh_pub: String,
+    },
+    /// El iniciador revela su clave DH efímera `A` en `hex(A)`, recién después de
+    /// ver `B`. El respondedor verifica que `SHA-256(A)` coincida con el
+    /// `commitment` del `PairRequest`; si no, aborta (es la señal del
+    /// intermediario).
+    PairReveal {
+        dh_pub: String,
+    },
+    /// Respuesta final del pareo, tras comparar el SAS en las dos pantallas.
     PairResponse {
         accepted: bool,
     },
@@ -180,45 +199,6 @@ pub fn decode(bytes: &[u8]) -> Result<Message, serde_json::Error> {
     serde_json::from_slice(bytes)
 }
 
-/// El código corto que las dos pantallas muestran durante el pareo.
-///
-/// Se calcula sobre las dos huellas, ordenadas, para que las dos puntas saquen
-/// el mismo número sin importar quién empezó. Que coincida le dice a la persona
-/// que las dos están fijando los certificados que creen; un intermediario que
-/// cambió un certificado da otro número.
-///
-/// El número de seis dígitos sale de SHA-256 de las dos huellas ordenadas: así
-/// las dos puntas sacan el mismo sin importar quién empezó, y no se puede
-/// precomputar un número a partir de otro con un plegado débil.
-///
-/// shortcut: esto sube la barra pero no es un SAS completo. El código sigue
-/// saliendo de dos huellas públicas de larga vida, así que un intermediario
-/// podría, con esfuerzo, generar certificados offline hasta que las dos pantallas
-/// muestren el mismo número de seis dígitos (colisión de SAS, RFC 6189). El fix
-/// completo es un intercambio con compromiso al estilo RFC 6189 (cada lado se
-/// compromete a su aporte antes de ver el del otro), y va como follow-up: no se
-/// rediseña el pareo en este PR. La seguridad real la sigue dando el pinning del
-/// certificado; este número es la verificación humana contra un intermediario.
-pub fn verification_code(fingerprint_a: &str, fingerprint_b: &str) -> String {
-    let (first, second) = if fingerprint_a <= fingerprint_b {
-        (fingerprint_a, fingerprint_b)
-    } else {
-        (fingerprint_b, fingerprint_a)
-    };
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(first.as_bytes());
-    hasher.update(b":");
-    hasher.update(second.as_bytes());
-    let digest = hasher.finalize();
-    // Los primeros ocho bytes del hash como número, y los seis dígitos de abajo.
-    // Tomar sólo una parte del hash no debilita nada acá: el espacio de salida son
-    // seis dígitos de todos modos.
-    let mut head = [0u8; 8];
-    head.copy_from_slice(&digest[..8]);
-    let value = u64::from_be_bytes(head) % 1_000_000;
-    format!("{value:06}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,7 +227,13 @@ mod tests {
         vec![
             Message::Hello(peer()),
             Message::PairRequest {
-                verification: "012345".into(),
+                commitment: "ab12".into(),
+            },
+            Message::PairDh {
+                dh_pub: "cd34".into(),
+            },
+            Message::PairReveal {
+                dh_pub: "ef56".into(),
             },
             Message::PairResponse { accepted: true },
             Message::PairResponse { accepted: false },
@@ -294,9 +280,14 @@ mod tests {
         let tag = |m: Message| json(&m)["type"].as_str().unwrap().to_owned();
         assert_eq!(
             tag(Message::PairRequest {
-                verification: "1".into()
+                commitment: "1".into()
             }),
             "pair_request"
+        );
+        assert_eq!(tag(Message::PairDh { dh_pub: "1".into() }), "pair_dh");
+        assert_eq!(
+            tag(Message::PairReveal { dh_pub: "1".into() }),
+            "pair_reveal"
         );
         assert_eq!(
             tag(Message::PairResponse { accepted: true }),
@@ -359,46 +350,6 @@ mod tests {
         assert!(decode(br#"{"text":"sin type"}"#).is_err());
         // falta un campo obligatorio de la variante
         assert!(decode(br#"{"type":"pair_response"}"#).is_err());
-    }
-
-    #[test]
-    fn el_codigo_de_verificacion_no_depende_del_orden() {
-        let a = "AA:BB:CC:DD";
-        let b = "11:22:33:44";
-        assert_eq!(verification_code(a, b), verification_code(b, a));
-    }
-
-    #[test]
-    fn el_codigo_es_el_sha256_truncado_de_las_huellas_ordenadas() {
-        // Vector calculado aparte: SHA-256("11:22:33:44:AA:BB:CC:DD"), primeros
-        // ocho bytes como u64 big-endian, módulo un millón.
-        assert_eq!(verification_code("AA:BB:CC:DD", "11:22:33:44"), "506230");
-    }
-
-    #[test]
-    fn el_codigo_cambia_si_cambia_una_huella() {
-        let base = verification_code("AA:BB", "CC:DD");
-        assert_ne!(base, verification_code("AA:BC", "CC:DD"));
-        assert_ne!(base, verification_code("AA:BB", "CC:DE"));
-    }
-
-    #[test]
-    fn el_codigo_es_determinista_y_de_seis_digitos() {
-        for (a, b) in [("", ""), ("a", "b"), ("AA:BB:CC", "DD:EE:FF"), ("x", "x")] {
-            let code = verification_code(a, b);
-            assert_eq!(code.len(), 6, "{code}");
-            assert!(code.chars().all(|c| c.is_ascii_digit()), "{code}");
-            assert_eq!(code, verification_code(a, b));
-        }
-    }
-
-    #[test]
-    fn un_codigo_con_ceros_a_la_izquierda_conserva_los_seis_caracteres() {
-        // Entre muchas huellas alguna da un número chico: el relleno debe verse.
-        let found = (0..5000)
-            .map(|i| verification_code(&format!("fp{i}"), "otra"))
-            .any(|c| c.starts_with('0'));
-        assert!(found, "ninguna salió con cero a la izquierda");
     }
 
     #[test]
