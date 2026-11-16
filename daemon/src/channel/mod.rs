@@ -646,7 +646,7 @@ async fn handle_session<S>(
                     // vive acá.
                     Some(Ok(Message::Pong)) => { missed_pongs = 0; }
                     Some(Ok(message)) => {
-                        if !handle_message(message, &device_id, &peer, &own.fingerprint, &fingerprint, &mut writer, &state, &connection).await {
+                        if !handle_message(message, &device_id, session_id, &peer, &own.fingerprint, &fingerprint, &mut writer, &state, &connection).await {
                             break;
                         }
                     }
@@ -750,6 +750,7 @@ where
 async fn handle_message<W>(
     message: Message,
     device_id: &str,
+    session_id: u64,
     peer: &PeerInfo,
     own_fingerprint: &str,
     fingerprint: &str,
@@ -788,8 +789,20 @@ where
         Message::PairDh { dh_pub } => {
             // Somos el iniciador: el par reveló su clave DH. Computamos el secreto
             // compartido con la nuestra, derivamos el SAS y revelamos nuestra clave.
-            match advance_on_peer_dh(state, device_id, own_fingerprint, fingerprint, &dh_pub).await
+            match advance_on_peer_dh(
+                state,
+                device_id,
+                session_id,
+                own_fingerprint,
+                fingerprint,
+                &dh_pub,
+            )
+            .await
             {
+                Some(action) if action.abort => {
+                    warn!(%device_id, "el acuerdo DH con la clave del par falló: se aborta el pareo");
+                    return false;
+                }
                 Some(action) => {
                     apply_pairing_over_writer(
                         action,
@@ -812,15 +825,21 @@ where
             // Somos el respondedor: el par reveló su clave. La máquina verifica que
             // su hash coincida con el compromiso en tiempo constante; si no, es un
             // intermediario y se aborta cerrando la sesión.
-            let Some(action) =
-                advance_on_peer_reveal(state, device_id, own_fingerprint, fingerprint, &dh_pub)
-                    .await
+            let Some(action) = advance_on_peer_reveal(
+                state,
+                device_id,
+                session_id,
+                own_fingerprint,
+                fingerprint,
+                &dh_pub,
+            )
+            .await
             else {
                 debug!(%device_id, "reveal del par inválido o sin pareo entrante en curso: se ignora");
                 return true;
             };
             if action.abort {
-                warn!(%device_id, "el reveal del par no coincide con el compromiso: se aborta el pareo");
+                warn!(%device_id, "el reveal del par no coincide con el compromiso o el acuerdo DH falló: se aborta el pareo");
                 return false;
             }
             // El aviso del sistema es para el pedido entrante, ya con el SAS
@@ -1033,13 +1052,32 @@ async fn begin_respond(
     Some(action)
 }
 
+/// La acción de abortar cuando el acuerdo X25519 con la clave del par falla. El
+/// secreto efímero ya se consumió (`agree_ephemeral` lo consume aun al fallar),
+/// así que dejar la sesión en su estado comprometido la dejaría trabada: no
+/// podría completar el pareo ni reintentar (`begin_initiate` sólo arranca desde
+/// `Idle`). Se trata como terminal: se resetea y se aborta para que el handler
+/// cierre la sesión.
+fn agreement_failed_abort(session: &mut Session) -> pure::PairingAction {
+    session.pair = PairingState::Idle;
+    pure::PairingAction {
+        next: PairingState::Idle,
+        send: None,
+        pin: false,
+        notify_code: None,
+        abort: true,
+    }
+}
+
 /// Procesa el `PairDh` del par (somos el iniciador): computa el secreto
 /// compartido con nuestra clave, deriva el SAS con el orden canónico (iniciador
 /// primero) y hace avanzar la máquina revelando nuestra clave. `None` si no
-/// estábamos esperando el DH o si la clave del par es inválida.
+/// estábamos esperando el DH, si la ranura ya es de otra sesión o si la clave del
+/// par es inválida; una acción con `abort` si el acuerdo DH falla.
 async fn advance_on_peer_dh(
     state: &Arc<Mutex<State>>,
     device_id: &str,
+    session_id: u64,
     own_fingerprint: &str,
     peer_fingerprint: &str,
     peer_dh_hex: &str,
@@ -1047,13 +1085,21 @@ async fn advance_on_peer_dh(
     let mut guard = state.lock().await;
     let ch = guard.channel.as_mut()?;
     let session = ch.sessions.get_mut(device_id)?;
+    // Sólo el dueño actual de la ranura toca el material DH: si esta sesión fue
+    // reemplazada por otra con el mismo `device_id`, el lector viejo no debe
+    // consumir la clave efímera de la nueva (dejaría a la nueva sin poder parear).
+    if !owns_session_slot(Some(session.session_id), session_id) {
+        return None;
+    }
     if !matches!(session.pair, PairingState::OutgoingCommitted) {
         return None;
     }
     let peer_public = hex::decode(peer_dh_hex).ok()?;
     let secret = session.dh_secret.take()?;
     let own_public = session.dh_public.clone();
-    let shared = compute_shared(secret, &peer_public)?;
+    let Some(shared) = compute_shared(secret, &peer_public) else {
+        return Some(agreement_failed_abort(session));
+    };
     // Iniciador: nuestra clave es `init_pub`, la del par `resp_pub`.
     let sas = derive_sas(
         &shared,
@@ -1081,6 +1127,7 @@ async fn advance_on_peer_dh(
 async fn advance_on_peer_reveal(
     state: &Arc<Mutex<State>>,
     device_id: &str,
+    session_id: u64,
     own_fingerprint: &str,
     peer_fingerprint: &str,
     peer_dh_hex: &str,
@@ -1088,13 +1135,20 @@ async fn advance_on_peer_reveal(
     let mut guard = state.lock().await;
     let ch = guard.channel.as_mut()?;
     let session = ch.sessions.get_mut(device_id)?;
+    // Igual que en `advance_on_peer_dh`: sólo el dueño actual de la ranura toca el
+    // material DH, para que un lector reemplazado no consuma la clave de la nueva.
+    if !owns_session_slot(Some(session.session_id), session_id) {
+        return None;
+    }
     if !matches!(session.pair, PairingState::IncomingCommitted { .. }) {
         return None;
     }
     let peer_public = hex::decode(peer_dh_hex).ok()?;
     let secret = session.dh_secret.take()?;
     let own_public = session.dh_public.clone();
-    let shared = compute_shared(secret, &peer_public)?;
+    let Some(shared) = compute_shared(secret, &peer_public) else {
+        return Some(agreement_failed_abort(session));
+    };
     // Respondedor: la clave del par es `init_pub`, la nuestra `resp_pub`.
     let sas = derive_sas(
         &shared,
@@ -1579,5 +1633,101 @@ mod tests {
             unpaired_rx.try_recv().is_err(),
             "el par sin parear no debe recibir nada"
         );
+    }
+
+    /// Estado con una sola sesión en `pair`, con una clave efímera real lista
+    /// para consumirse; devuelve también la pública propia.
+    fn state_with_pairing(pair: PairingState, session_id: u64) -> Arc<Mutex<State>> {
+        let (mut s, _rx) = session(false, session_id);
+        let (secret, public) = generate_ephemeral().expect("el generador del sistema debe andar");
+        s.pair = pair;
+        s.dh_secret = Some(secret);
+        s.dh_public = public;
+        let mut rt = runtime(vec![("par", s)]);
+        // El receptor se descarta con `_rx`: estas pruebas no leen lo enviado.
+        rt.commands = mpsc::unbounded_channel().0;
+        Arc::new(Mutex::new(State {
+            devices: HashMap::new(),
+            apps: HashMap::new(),
+            cameras: HashMap::new(),
+            windows: Default::default(),
+            webcam: Default::default(),
+            registry: Default::default(),
+            channel: Some(rt),
+        }))
+    }
+
+    async fn has_secret(state: &Arc<Mutex<State>>) -> bool {
+        let guard = state.lock().await;
+        guard.channel.as_ref().unwrap().sessions["par"]
+            .dh_secret
+            .is_some()
+    }
+
+    #[tokio::test]
+    async fn un_lector_reemplazado_no_consume_la_clave_al_recibir_el_dh() {
+        let state = state_with_pairing(PairingState::OutgoingCommitted, 7);
+        let (_, peer_public) = generate_ephemeral().unwrap();
+
+        let action =
+            advance_on_peer_dh(&state, "par", 6, "yo", "otro", &hex::encode(peer_public)).await;
+
+        assert!(
+            action.is_none(),
+            "una sesión vieja no debe avanzar el pareo"
+        );
+        assert!(
+            has_secret(&state).await,
+            "la clave de la sesión nueva sigue intacta"
+        );
+    }
+
+    #[tokio::test]
+    async fn un_acuerdo_dh_fallido_aborta_el_pareo_del_iniciador() {
+        let state = state_with_pairing(PairingState::OutgoingCommitted, 7);
+
+        let action = advance_on_peer_dh(&state, "par", 7, "yo", "otro", "")
+            .await
+            .expect("el acuerdo fallido debe devolver una acción, no dejar la sesión trabada");
+
+        assert!(action.abort);
+        assert_eq!(action.next, PairingState::Idle);
+        assert!(action.send.is_none());
+    }
+
+    #[tokio::test]
+    async fn un_lector_reemplazado_no_consume_la_clave_al_recibir_el_reveal() {
+        let pair = PairingState::IncomingCommitted {
+            commitment: String::new(),
+        };
+        let state = state_with_pairing(pair, 7);
+        let (_, peer_public) = generate_ephemeral().unwrap();
+
+        let action =
+            advance_on_peer_reveal(&state, "par", 6, "yo", "otro", &hex::encode(peer_public)).await;
+
+        assert!(
+            action.is_none(),
+            "una sesión vieja no debe avanzar el pareo"
+        );
+        assert!(
+            has_secret(&state).await,
+            "la clave de la sesión nueva sigue intacta"
+        );
+    }
+
+    #[tokio::test]
+    async fn un_acuerdo_dh_fallido_aborta_el_pareo_del_respondedor() {
+        let pair = PairingState::IncomingCommitted {
+            commitment: String::new(),
+        };
+        let state = state_with_pairing(pair, 7);
+
+        let action = advance_on_peer_reveal(&state, "par", 7, "yo", "otro", "")
+            .await
+            .expect("el acuerdo fallido debe devolver una acción, no dejar la sesión trabada");
+
+        assert!(action.abort);
+        assert_eq!(action.next, PairingState::Idle);
     }
 }
