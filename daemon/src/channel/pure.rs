@@ -1631,4 +1631,36 @@ mod tests {
     fn un_oculto_sin_extension_lleva_el_sufijo_al_final() {
         assert_eq!(numbered_filename(".bashrc", 1), ".bashrc (1)");
     }
+
+    #[test]
+    fn el_numerado_de_un_nombre_de_255_bytes_no_pasa_de_255() {
+        let name = format!("{}.jpg", "a".repeat(251));
+        assert_eq!(name.len(), 255);
+        let out = numbered_filename(&name, 1);
+        assert!(out.len() <= 255, "{} bytes", out.len());
+        assert!(out.ends_with(" (1).jpg"), "{out}");
+        // Sin extensión también.
+        let out = numbered_filename(&"a".repeat(255), 12);
+        assert_eq!(out.len(), 255);
+        assert!(out.ends_with(" (12)"));
+    }
+
+    #[test]
+    fn el_numerado_recorta_en_borde_de_caracter_multibyte() {
+        // 126 'ñ' (252 bytes) + ".md": 255 bytes. Con " (1)" hay que quitar
+        // bytes de la base, y 'ñ' ocupa 2: no se puede cortar en el medio.
+        let name = format!("{}.md", "ñ".repeat(126));
+        assert_eq!(name.len(), 255);
+        let out = numbered_filename(&name, 1);
+        assert!(out.len() <= 255, "{} bytes", out.len());
+        assert!(out.ends_with(" (1).md"), "{out}");
+        assert!(out.starts_with('ñ'));
+        // Emoji de 4 bytes: lo mismo.
+        let name = format!("{}.md", "😀".repeat(63));
+        assert_eq!(name.len(), 255);
+        let out = numbered_filename(&name, 1);
+        assert!(out.len() <= 255, "{} bytes", out.len());
+        assert!(out.ends_with(" (1).md"), "{out}");
+        assert!(out.trim_end_matches(" (1).md").chars().all(|c| c == '😀'));
+    }
 }

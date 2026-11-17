@@ -2142,6 +2142,7 @@ mod tests {
     /// paralelo se pisarían.
     #[tokio::test]
     async fn el_puerto_de_carga_con_otra_huella_no_deja_ningun_archivo() {
+        let _env = ENV_LOCK.lock().await;
         let cfg = scratch_dir("cfg");
         let downloads = scratch_dir("descargas");
         std::fs::write(
@@ -2232,5 +2233,111 @@ mod tests {
         assert!(res.is_err(), "O_EXCL debe fallar ante un symlink: {res:?}");
         assert_eq!(std::fs::read(&victim).unwrap(), b"intacto");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Serializa las pruebas que redirigen `XDG_CONFIG_HOME` (global del proceso).
+    static ENV_LOCK: Mutex<()> = Mutex::const_new(());
+
+    /// Redirige `dirs::download_dir()` a una carpeta nueva; devuelve (config, descargas).
+    fn redirect_downloads() -> (std::path::PathBuf, std::path::PathBuf) {
+        let cfg = scratch_dir("cfg");
+        let downloads = scratch_dir("descargas");
+        std::fs::write(
+            cfg.join("user-dirs.dirs"),
+            format!("XDG_DOWNLOAD_DIR=\"{}\"\n", downloads.display()),
+        )
+        .unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &cfg);
+        assert_eq!(dirs::download_dir().as_deref(), Some(downloads.as_path()));
+        (cfg, downloads)
+    }
+
+    fn state_with_identity(identity: Identity) -> Arc<Mutex<State>> {
+        let mut rt = runtime(vec![]);
+        rt.identity = Arc::new(identity);
+        Arc::new(Mutex::new(State {
+            devices: HashMap::new(),
+            apps: HashMap::new(),
+            cameras: HashMap::new(),
+            windows: Default::default(),
+            webcam: Default::default(),
+            registry: Default::default(),
+            channel: Some(rt),
+        }))
+    }
+
+    #[tokio::test]
+    async fn el_quinto_permiso_de_transferencia_se_niega_hasta_que_se_suelta_uno() {
+        let state = state_with_identity(real_identity());
+        let mut held = Vec::new();
+        for _ in 0..MAX_CONCURRENT_FILE_TRANSFERS {
+            held.push(
+                file_transfer_permit(&state)
+                    .await
+                    .expect("hasta el tope se concede"),
+            );
+        }
+        assert!(
+            file_transfer_permit(&state).await.is_none(),
+            "pasado el tope no se concede ni se encola"
+        );
+        held.pop();
+        assert!(
+            file_transfer_permit(&state).await.is_some(),
+            "al soltar uno vuelve a haber lugar"
+        );
+    }
+
+    #[tokio::test]
+    async fn sin_canal_no_hay_permiso_de_transferencia() {
+        let state = state_with_identity(real_identity());
+        state.lock().await.channel = None;
+        assert!(file_transfer_permit(&state).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn dos_recepciones_del_mismo_nombre_no_se_pisan_ni_siguen_un_symlink() {
+        let _env = ENV_LOCK.lock().await;
+        let (cfg, downloads) = redirect_downloads();
+        let pinned = real_identity();
+        let state = state_with_identity(real_identity());
+        let loopback: IpAddr = std::net::Ipv4Addr::LOCALHOST.into();
+        let fp = pinned.fingerprint.clone();
+
+        // Un symlink plantado en el destino final: no se sigue ni se pisa.
+        let victim = downloads.join("victima.txt");
+        std::fs::write(&victim, b"intacto").unwrap();
+        std::os::unix::fs::symlink(&victim, downloads.join("foto.jpg")).unwrap();
+
+        let port = spawn_payload_server(pinned_clone(&pinned), b"uno".to_vec()).await;
+        let first = download_file(&offer(port, 3), "foto.jpg", loopback, &fp, &state)
+            .await
+            .expect("primera recepción");
+        let port = spawn_payload_server(pinned_clone(&pinned), b"dos".to_vec()).await;
+        let second = download_file(&offer(port, 3), "foto.jpg", loopback, &fp, &state)
+            .await
+            .expect("segunda recepción");
+
+        // El nombre final (el que lleva la señal `file_received`) sale de la ruta.
+        assert_eq!(first.file_name().unwrap(), "foto (1).jpg");
+        assert_eq!(second.file_name().unwrap(), "foto (2).jpg");
+        assert_eq!(std::fs::read(&first).unwrap(), b"uno");
+        assert_eq!(std::fs::read(&second).unwrap(), b"dos");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"intacto");
+        assert!(
+            std::fs::symlink_metadata(downloads.join("foto.jpg"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "el symlink del destino sigue siendo el que era"
+        );
+        assert!(
+            !only_files(&downloads).iter().any(|f| f.ends_with(".part")),
+            "no queda ningún temporal: {:?}",
+            only_files(&downloads)
+        );
+
+        let _ = std::fs::remove_dir_all(&cfg);
+        let _ = std::fs::remove_dir_all(&downloads);
     }
 }
