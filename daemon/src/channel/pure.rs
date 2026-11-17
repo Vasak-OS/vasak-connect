@@ -770,6 +770,93 @@ pub fn accept_incoming_clipboard(paired: bool, text: String) -> Option<String> {
     Some(text)
 }
 
+// ── Recepción de archivos ────────────────────────────────────────────────────
+
+/// Tope de un archivo entrante, en bytes. Un `FileOffer` que lo pase se rechaza
+/// antes de abrir la conexión de carga: así un par no puede anunciar un tamaño
+/// enorme y hacernos llenar el disco de descargas.
+///
+/// shortcut: 2 GiB fijo y generoso para fotos y videos del teléfono; si hiciera
+/// falta un límite por espacio libre real o configurable, lo ajusta security.
+pub const MAX_FILE_SIZE: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Qué hacer con un `FileOffer` entrante, decidido sin tocar la red ni el disco.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileOfferDecision {
+    /// El par no está pareado: se ignora en silencio, **sin** contestarle nada.
+    /// No se le confirma ni se le niega un archivo a un aparato sin parear, igual
+    /// que con la batería y el portapapeles.
+    Ignore,
+    /// Par pareado pero el ofrecimiento no pasa —nombre inseguro o tamaño sobre el
+    /// tope—: se rechaza con `FileResult { ok: false }`, sin abrir nada.
+    Reject,
+    /// Par pareado y ofrecimiento válido: se recibe en este nombre ya saneado.
+    Accept { filename: String },
+}
+
+/// Sanea el nombre propuesto por el par antes de unirlo a una ruta.
+///
+/// El contrato ([`wire::FileOffer::name`]) avisa que el emisor no garantiza nada:
+/// el nombre puede traer barras, `..`, un NUL, ser vacío o absoluto. Acá se
+/// devuelve sólo un nombre de archivo simple —sin separadores de ruta, sin `..`,
+/// sin caracteres de control, no vacío y de largo acotado— o `None` para
+/// rechazarlo. El destino final es siempre `download_dir().join(este nombre)`;
+/// como no quedan separadores, ese `join` no puede escapar de la carpeta.
+pub fn sanitize_incoming_filename(name: &str) -> Option<String> {
+    if name.is_empty() {
+        return None;
+    }
+    // 255 bytes es el límite típico de un nombre en la mayoría de los sistemas de
+    // archivos; un nombre más largo sólo haría fallar el `create`, así que se
+    // rechaza acá, donde se puede probar.
+    if name.len() > 255 {
+        return None;
+    }
+    // Separadores de ruta (incluido `\` por defensa en profundidad) y caracteres
+    // de control (el NUL entre ellos) no van en un nombre de archivo.
+    if name.contains('/') || name.contains('\\') || name.chars().any(char::is_control) {
+        return None;
+    }
+    // `.` y `..` no son nombres de archivo utilizables y `..` es el caso de
+    // escape clásico.
+    if name == "." || name == ".." {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+/// La decisión sobre un `FileOffer` entrante: la puerta de confianza (pareado), el
+/// tope de tamaño y el saneo del nombre, todo sin red ni disco.
+pub fn decide_incoming_file(paired: bool, name: &str, size: u64) -> FileOfferDecision {
+    if !paired {
+        return FileOfferDecision::Ignore;
+    }
+    if size > MAX_FILE_SIZE {
+        return FileOfferDecision::Reject;
+    }
+    match sanitize_incoming_filename(name) {
+        Some(filename) => FileOfferDecision::Accept { filename },
+        None => FileOfferDecision::Reject,
+    }
+}
+
+/// El nombre a usar en el intento número `n` para no pisar un archivo que ya
+/// existe: el nombre tal cual en `n == 0`, y con un sufijo ` (n)` antes de la
+/// extensión en los siguientes. Pura para poder probar la desambiguación sin
+/// tocar el disco; el bucle que mira si existe cada candidato vive en el código
+/// async.
+pub fn numbered_filename(name: &str, n: u32) -> String {
+    if n == 0 {
+        return name.to_string();
+    }
+    match name.rsplit_once('.') {
+        // Sólo se trata el punto como separador de extensión si hay algo antes
+        // (un oculto como `.bashrc` lleva el sufijo al final, no en medio).
+        Some((stem, ext)) if !stem.is_empty() => format!("{stem} ({n}).{ext}"),
+        _ => format!("{name} ({n})"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -16,13 +16,14 @@ pub mod pure;
 pub mod transport;
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use ring::agreement;
 use ring::rand::SystemRandom;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::time::{interval, timeout};
@@ -31,7 +32,7 @@ use tokio_stream::StreamExt;
 use tokio_util::codec::FramedRead;
 use tracing::{debug, info, warn};
 use vasak_connect_protocol::wire::{
-    BatteryStatus, DeviceKind, Message, PeerInfo, PROTOCOL_VERSION,
+    BatteryStatus, DeviceKind, FileOffer, Message, PeerInfo, PROTOCOL_VERSION,
 };
 
 use crate::{notify, State};
@@ -46,6 +47,11 @@ use transport::{peer_fingerprint, read_frame, write_frame, MessageDecoder, Sessi
 /// Numerador de sesiones: le da a cada `handle_session` un id único, para que la
 /// limpieza de una sesión vieja no toque la entrada de una de reemplazo.
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Numerador de temporales de descarga: le da a cada archivo entrante un nombre
+/// `.part` único y propio, para que dos transferencias a la vez no se pisen y
+/// para no derivar el temporal de nada que el par controle.
+static NEXT_PART_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Cada cuánto se manda un `Ping` para mantener viva la sesión y notar un corte
 /// que el socket todavía no reportó.
@@ -84,6 +90,18 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// sesiones a medio parear para siempre.
 const PAIR_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Cuánto se espera cada trozo de un archivo entrante antes de dar la
+/// transferencia por muerta. Es un plazo de inactividad —se reinicia con cada
+/// trozo que llega—, no un tope del total: así un archivo grande por un enlace
+/// lento no se corta, pero un par que deja de enviar no deja la tarea colgada.
+const PAYLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Cuánto se espera, ya leídos los `size` bytes, a que el par cierre su lado. Un
+/// emisor correcto cierra y el `Ok(0)` llega al toque; este plazo corto sólo
+/// acota la ventana para notar un cuerpo más largo que el anunciado sin demorar
+/// cada transferencia.
+const PAYLOAD_TRAILER_GRACE: Duration = Duration::from_secs(3);
+
 /// Lo que un par anunció por mDNS y dónde alcanzarlo.
 pub struct Discovered {
     pub peer: PeerInfo,
@@ -107,6 +125,10 @@ pub struct Session {
     /// La huella del certificado del par en esta sesión, para fijarla si se
     /// confirma el pareo sin volver a bajar a la capa de TLS.
     pub fingerprint: String,
+    /// La IP del par en esta sesión. Es a donde se disca el puerto de carga de un
+    /// `FileOffer` (el par se saca de `discovered` al abrir la sesión, así que su
+    /// dirección se guarda acá).
+    peer_ip: IpAddr,
     pub paired: bool,
     /// El estado del pareo de esta sesión. Toda la lógica pasa por
     /// [`advance_pairing`]: fijar al par depende de este estado, no de un mensaje
@@ -368,7 +390,7 @@ pub async fn run(connection: zbus::Connection, state: Arc<Mutex<State>>) {
                                 Ok(Ok(tls)) => {
                                     let (_, server_conn) = tls.get_ref();
                                     let fingerprint = peer_fingerprint(server_conn.peer_certificates());
-                                    handle_session(tls, fingerprint, false, state, connection).await;
+                                    handle_session(tls, fingerprint, addr, false, state, connection).await;
                                 }
                                 Ok(Err(err)) => debug!(%err, "handshake entrante fallido"),
                                 Err(_) => debug!("handshake entrante sin completar a tiempo"),
@@ -460,7 +482,7 @@ async fn dial_and_pair(
     .map_err(|_| "el par no completó la conexión a tiempo")??;
     let (_, client_conn) = tls.get_ref();
     let fingerprint = peer_fingerprint(client_conn.peer_certificates());
-    handle_session(tls, fingerprint, true, state, connection).await;
+    handle_session(tls, fingerprint, address, true, state, connection).await;
     Ok(())
 }
 
@@ -472,6 +494,7 @@ async fn dial_and_pair(
 async fn handle_session<S>(
     tls: S,
     fingerprint: Option<String>,
+    peer_addr: SocketAddr,
     initiate_pair: bool,
     state: Arc<Mutex<State>>,
     connection: zbus::Connection,
@@ -591,6 +614,7 @@ async fn handle_session<S>(
                 name: peer.name.clone(),
                 kind: peer.kind,
                 fingerprint: fingerprint.clone(),
+                peer_ip: peer_addr.ip(),
                 paired,
                 pair: PairingState::Idle,
                 dh_secret: None,
@@ -924,12 +948,51 @@ where
             }
             true
         }
-        // La transferencia de archivos es de un PR posterior. El SAS con
-        // compromiso (RFC 6189) ya protege el primer pareo; falta sólo la
-        // transferencia en sí. Por ahora se reconoce y se ignora sin cerrar la
-        // sesión.
-        Message::FileOffer(_) | Message::FileResult { .. } => {
-            debug!(%device_id, "transferencia de archivos aún no implementada; se ignora");
+        Message::FileOffer(offer) => {
+            // Sólo de un par pareado, igual que la batería y el portapapeles. La
+            // puerta de confianza, el tope de tamaño y el saneo del nombre son
+            // puros ([`pure::decide_incoming_file`]); acá sólo se actúa sobre la
+            // decisión.
+            let paired = session_paired(state, device_id).await;
+            match pure::decide_incoming_file(paired, &offer.name, offer.size) {
+                // Sin parear: se ignora en silencio, sin confirmarle nada al par.
+                pure::FileOfferDecision::Ignore => {}
+                // Pareado pero el ofrecimiento no pasa (nombre inseguro o tamaño
+                // sobre el tope): se rechaza sin abrir ninguna conexión.
+                pure::FileOfferDecision::Reject => {
+                    let _ = send_with_deadline(
+                        writer,
+                        &Message::FileResult {
+                            id: offer.id,
+                            ok: false,
+                        },
+                    )
+                    .await;
+                }
+                // Pareado y válido: se recibe en una tarea aparte para no bloquear
+                // el bucle de la sesión (keepalive, cierre) durante la
+                // transferencia; esa tarea contesta el `FileResult` por el canal de
+                // salida al terminar.
+                pure::FileOfferDecision::Accept { filename } => {
+                    if let Some(peer_ip) = session_peer_ip(state, device_id).await {
+                        tokio::spawn(receive_file(
+                            offer,
+                            filename,
+                            peer_ip,
+                            device_id.to_string(),
+                            state.clone(),
+                            connection.clone(),
+                        ));
+                    }
+                }
+            }
+            true
+        }
+        // El `FileResult` es la respuesta a una transferencia **saliente** (el
+        // escritorio envía), que es de un PR posterior. Del lado receptor no hace
+        // falta: se reconoce y se ignora sin cerrar la sesión.
+        Message::FileResult { .. } => {
+            debug!(%device_id, "envío de archivos aún no implementado; se ignora el FileResult");
             true
         }
         // Un segundo `Hello` en la misma sesión no tiene sentido (ya se consumió en
@@ -960,6 +1023,163 @@ async fn set_session_battery(state: &Arc<Mutex<State>>, device_id: &str, status:
     {
         session.battery = Some(status);
     }
+}
+
+/// La IP del par en la sesión abierta con ese `device_id`, a donde discar el
+/// puerto de carga de un `FileOffer`. `None` si no hay sesión.
+async fn session_peer_ip(state: &Arc<Mutex<State>>, device_id: &str) -> Option<IpAddr> {
+    let guard = state.lock().await;
+    guard
+        .channel
+        .as_ref()
+        .and_then(|ch| ch.sessions.get(device_id))
+        .map(|session| session.peer_ip)
+}
+
+/// Recibe un archivo ofrecido por un par pareado: lo baja, emite la señal de
+/// D-Bus si salió bien y, en todo caso, le contesta al par con el `FileResult`
+/// por la sesión de control. Corre en su propia tarea para no bloquear el bucle
+/// de la sesión durante la transferencia.
+async fn receive_file(
+    offer: FileOffer,
+    filename: String,
+    peer_ip: IpAddr,
+    device_id: String,
+    state: Arc<Mutex<State>>,
+    connection: zbus::Connection,
+) {
+    let ok = match download_file(&offer, &filename, peer_ip, &state).await {
+        Ok(path) => {
+            info!(%device_id, file = %filename, "archivo recibido");
+            // El daemon no abre el archivo ni toca el escritorio: sólo avisa el
+            // nombre y la ruta final para que otro decida qué hacer.
+            emit_file_received(&connection, &filename, &path.to_string_lossy()).await;
+            true
+        }
+        Err(err) => {
+            debug!(%device_id, %err, "no se pudo recibir el archivo ofrecido");
+            false
+        }
+    };
+    let guard = state.lock().await;
+    if let Some(ch) = guard.channel.as_ref() {
+        ch.send_to(&device_id, Message::FileResult { id: offer.id, ok });
+    }
+}
+
+/// Baja los bytes de un `FileOffer`: disca el puerto de carga del par por el mismo
+/// TLS mutuo que la sesión de control, lee exactamente `size` bytes a un temporal
+/// y lo renombra al nombre final (desambiguado si ya existe). Devuelve la ruta
+/// final, o un error que deja `ok: false` y no deja ningún archivo a medias.
+async fn download_file(
+    offer: &FileOffer,
+    filename: &str,
+    peer_ip: IpAddr,
+    state: &Arc<Mutex<State>>,
+) -> Result<std::path::PathBuf, String> {
+    let dir = dirs::download_dir().ok_or("no hay carpeta de descargas")?;
+
+    // Mismo TLS mutuo que el control: se arma el config de cliente desde la
+    // identidad del canal y se disca a la IP del par con el puerto de **carga**
+    // del offer (no el de control).
+    let identity = {
+        let guard = state.lock().await;
+        guard.channel.as_ref().map(|ch| ch.identity.clone())
+    }
+    .ok_or("el canal no está activo")?;
+    let client_cfg = transport::client_config(&identity)
+        .map_err(|err| format!("configuración TLS de carga inválida: {err}"))?;
+    let connector = TlsConnector::from(Arc::new(client_cfg));
+    // El nombre del servidor en el TLS no se valida (no hay CA, la confianza la da
+    // la huella del certificado), pero rustls pide uno bien formado.
+    let server_name = rustls_pki_types::ServerName::try_from("vasak-connect")
+        .map_err(|err| format!("nombre de servidor inválido: {err}"))?
+        .to_owned();
+    let addr = SocketAddr::new(peer_ip, offer.payload_port);
+    let mut tls = timeout(HANDSHAKE_TIMEOUT, async {
+        let tcp = TcpStream::connect(addr).await?;
+        connector.connect(server_name, tcp).await
+    })
+    .await
+    .map_err(|_| "la conexión de carga no se completó a tiempo".to_string())?
+    .map_err(|err| format!("no se pudo abrir la conexión de carga: {err}"))?;
+
+    // Temporal oculto y único: no deriva de nada que el par controle, no pisa un
+    // archivo del usuario y, si la transferencia falla, se borra sin dejar un
+    // archivo a medias con el nombre final.
+    let part = NEXT_PART_ID.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!(".vsk-connect-{part}.part"));
+
+    if let Err(err) = stream_payload_to_file(&mut tls, offer.size, &tmp).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(err);
+    }
+
+    // Nombre final saneado; si ya existe, se desambigua con un sufijo en vez de
+    // pisarlo en silencio.
+    let final_path = {
+        let mut n = 0u32;
+        loop {
+            let candidate = dir.join(pure::numbered_filename(filename, n));
+            if !tokio::fs::try_exists(&candidate).await.unwrap_or(false) {
+                break candidate;
+            }
+            n += 1;
+            if n > 10_000 {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                return Err("demasiados archivos con ese nombre en descargas".into());
+            }
+        }
+    };
+    if let Err(err) = tokio::fs::rename(&tmp, &final_path).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(format!("no se pudo mover el archivo a su destino: {err}"));
+    }
+    Ok(final_path)
+}
+
+/// Lee exactamente `size` bytes de `reader` y los escribe a `tmp`, en trozos para
+/// no cargar el archivo entero en memoria. Falla si el par cierra antes (cuerpo
+/// corto), si manda de más (cuerpo largo) o si deja de enviar más de
+/// [`PAYLOAD_IDLE_TIMEOUT`] (se da por muerta).
+async fn stream_payload_to_file(
+    reader: &mut (impl AsyncReadExt + Unpin),
+    size: u64,
+    tmp: &std::path::Path,
+) -> Result<(), String> {
+    let mut file = tokio::fs::File::create(tmp)
+        .await
+        .map_err(|err| format!("no se pudo crear el temporal: {err}"))?;
+    let mut remaining = size;
+    let mut buf = [0u8; 64 * 1024];
+    while remaining > 0 {
+        let want = remaining.min(buf.len() as u64) as usize;
+        let n = match timeout(PAYLOAD_IDLE_TIMEOUT, reader.read(&mut buf[..want])).await {
+            Ok(Ok(n)) => n,
+            Ok(Err(err)) => return Err(format!("error al leer el payload: {err}")),
+            Err(_) => return Err("el par dejó de enviar: se agotó el tiempo".into()),
+        };
+        if n == 0 {
+            return Err("el par cerró antes de enviar todos los bytes anunciados".into());
+        }
+        file.write_all(&buf[..n])
+            .await
+            .map_err(|err| format!("no se pudo escribir el archivo: {err}"))?;
+        remaining -= n as u64;
+    }
+    // Ya están los `size` bytes: un emisor correcto cierra ahora. Si en una
+    // ventana corta todavía llegan bytes, el cuerpo es más largo que el anunciado
+    // y se rechaza; un cierre (`Ok(0)`) o el silencio dentro de esa ventana se
+    // toman como fin para no demorar cada transferencia.
+    match timeout(PAYLOAD_TRAILER_GRACE, reader.read(&mut buf[..1])).await {
+        Ok(Ok(0)) | Err(_) => {}
+        Ok(Ok(_)) => return Err("el par envió más bytes que los anunciados".into()),
+        Ok(Err(err)) => return Err(format!("error al cerrar el payload: {err}")),
+    }
+    file.flush()
+        .await
+        .map_err(|err| format!("no se pudo vaciar el temporal: {err}"))?;
+    Ok(())
 }
 
 /// Hace avanzar la máquina de pareo de una sesión con un evento y guarda el
@@ -1542,6 +1762,18 @@ async fn emit_clipboard_received(connection: &zbus::Connection, text: &str) {
     let _ = crate::ConnectService::clipboard_received(&emitter, text).await;
 }
 
+/// Emite la señal de que un par pareado envió un archivo, ya recibido y guardado.
+/// El escritorio o la galería deciden qué hacer con él; el daemon sólo avisa el
+/// nombre y la ruta final.
+async fn emit_file_received(connection: &zbus::Connection, name: &str, path: &str) {
+    let Ok(emitter) =
+        zbus::object_server::SignalEmitter::new(connection, vasak_connect_protocol::SERVICE_PATH)
+    else {
+        return;
+    };
+    let _ = crate::ConnectService::file_received(&emitter, name, path).await;
+}
+
 /// Manda el texto copiado en el escritorio a cada par pareado y conectado.
 /// Devuelve a cuántos llegó. Lo llama el escritorio por D-Bus cuando cambia el
 /// portapapeles local.
@@ -1584,6 +1816,7 @@ mod tests {
             name: "Pixel 8".into(),
             kind: DeviceKind::Phone,
             fingerprint: String::new(),
+            peer_ip: std::net::Ipv4Addr::LOCALHOST.into(),
             paired,
             pair: PairingState::default(),
             dh_secret: None,
