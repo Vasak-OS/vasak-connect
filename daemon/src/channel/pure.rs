@@ -1672,4 +1672,28 @@ mod tests {
         assert!(out.ends_with(" (1).md"), "{out}");
         assert!(out.trim_end_matches(" (1).md").chars().all(|c| c == '😀'));
     }
+
+    #[test]
+    fn el_numerado_con_extension_larga_no_pasa_de_255_bytes() {
+        // La extensión sola casi llena el límite: el sufijo no cabe.
+        let name = format!("a.{}", "x".repeat(253));
+        assert_eq!(name.len(), 255);
+        let out = numbered_filename(&name, 1);
+        assert!(out.len() <= 255, "{} bytes", out.len());
+        assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn el_numerado_con_extension_larga_corta_en_borde_multibyte() {
+        // 'ñ' (2 bytes) en la extensión: el corte final cae en medio de una.
+        let name = format!("a.{}", "ñ".repeat(126));
+        assert_eq!(name.len(), 254);
+        for n in [1u32, 2, 10] {
+            let out = numbered_filename(&name, n);
+            assert!(out.len() <= 255, "n={n}: {} bytes", out.len());
+        }
+        let name = format!("a.{}", "😀".repeat(63));
+        let out = numbered_filename(&name, 1);
+        assert!(out.len() <= 255, "{} bytes", out.len());
+    }
 }

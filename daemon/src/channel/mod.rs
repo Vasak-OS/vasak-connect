@@ -2345,4 +2345,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&cfg);
         let _ = std::fs::remove_dir_all(&downloads);
     }
+
+    #[tokio::test]
+    async fn la_oferta_de_una_sesion_reemplazada_no_resuelve_el_endpoint() {
+        let state = state_with_identity(real_identity());
+        let (mut s, _rx) = session(true, 7);
+        s.fingerprint = "aa:bb".into();
+        state
+            .lock()
+            .await
+            .channel
+            .as_mut()
+            .unwrap()
+            .sessions
+            .insert("par".into(), s);
+
+        let got = session_peer_endpoint(&state, "par", 7).await;
+        assert_eq!(
+            got,
+            Some((std::net::Ipv4Addr::LOCALHOST.into(), "aa:bb".to_string()))
+        );
+        assert_eq!(
+            session_peer_endpoint(&state, "par", 6).await,
+            None,
+            "otra sesión con el mismo device_id no hereda el endpoint"
+        );
+        assert_eq!(session_peer_endpoint(&state, "otro", 7).await, None);
+    }
 }
