@@ -974,11 +974,14 @@ where
                 // transferencia; esa tarea contesta el `FileResult` por el canal de
                 // salida al terminar.
                 pure::FileOfferDecision::Accept { filename } => {
-                    if let Some(peer_ip) = session_peer_ip(state, device_id).await {
+                    if let Some((peer_ip, fingerprint)) =
+                        session_peer_endpoint(state, device_id).await
+                    {
                         tokio::spawn(receive_file(
                             offer,
                             filename,
                             peer_ip,
+                            fingerprint,
                             device_id.to_string(),
                             state.clone(),
                             connection.clone(),
@@ -1025,15 +1028,20 @@ async fn set_session_battery(state: &Arc<Mutex<State>>, device_id: &str, status:
     }
 }
 
-/// La IP del par en la sesión abierta con ese `device_id`, a donde discar el
-/// puerto de carga de un `FileOffer`. `None` si no hay sesión.
-async fn session_peer_ip(state: &Arc<Mutex<State>>, device_id: &str) -> Option<IpAddr> {
+/// La IP y la huella del certificado del par en la sesión abierta con ese
+/// `device_id`: a dónde discar el puerto de carga de un `FileOffer` y contra qué
+/// huella comparar el certificado que ese puerto presente. `None` si no hay
+/// sesión.
+async fn session_peer_endpoint(
+    state: &Arc<Mutex<State>>,
+    device_id: &str,
+) -> Option<(IpAddr, String)> {
     let guard = state.lock().await;
     guard
         .channel
         .as_ref()
         .and_then(|ch| ch.sessions.get(device_id))
-        .map(|session| session.peer_ip)
+        .map(|session| (session.peer_ip, session.fingerprint.clone()))
 }
 
 /// Recibe un archivo ofrecido por un par pareado: lo baja, emite la señal de
@@ -1044,11 +1052,12 @@ async fn receive_file(
     offer: FileOffer,
     filename: String,
     peer_ip: IpAddr,
+    expected_fingerprint: String,
     device_id: String,
     state: Arc<Mutex<State>>,
     connection: zbus::Connection,
 ) {
-    let ok = match download_file(&offer, &filename, peer_ip, &state).await {
+    let ok = match download_file(&offer, &filename, peer_ip, &expected_fingerprint, &state).await {
         Ok(path) => {
             info!(%device_id, file = %filename, "archivo recibido");
             // El daemon no abre el archivo ni toca el escritorio: sólo avisa el
@@ -1068,13 +1077,15 @@ async fn receive_file(
 }
 
 /// Baja los bytes de un `FileOffer`: disca el puerto de carga del par por el mismo
-/// TLS mutuo que la sesión de control, lee exactamente `size` bytes a un temporal
-/// y lo renombra al nombre final (desambiguado si ya existe). Devuelve la ruta
-/// final, o un error que deja `ok: false` y no deja ningún archivo a medias.
+/// TLS mutuo que la sesión de control, **comprueba que presente la misma huella
+/// fijada** que el par pareado, lee exactamente `size` bytes a un temporal y lo
+/// renombra al nombre final (desambiguado si ya existe). Devuelve la ruta final, o
+/// un error que deja `ok: false` y no deja ningún archivo a medias.
 async fn download_file(
     offer: &FileOffer,
     filename: &str,
     peer_ip: IpAddr,
+    expected_fingerprint: &str,
     state: &Arc<Mutex<State>>,
 ) -> Result<std::path::PathBuf, String> {
     let dir = dirs::download_dir().ok_or("no hay carpeta de descargas")?;
@@ -1103,6 +1114,24 @@ async fn download_file(
     .await
     .map_err(|_| "la conexión de carga no se completó a tiempo".to_string())?
     .map_err(|err| format!("no se pudo abrir la conexión de carga: {err}"))?;
+
+    // El verificador de TLS acepta cualquier certificado (la confianza es posterior
+    // al handshake, como en la ruta de control): acá se cierra el pinning. El puerto
+    // de carga tiene que presentar la **misma huella fijada** que el par pareado de
+    // la sesión de control; si no, es un atacante on-path que ganó la carrera a la
+    // IP:puerto, y se corta antes de abrir ningún archivo en descargas.
+    let presented = {
+        let (_, conn) = tls.get_ref();
+        peer_fingerprint(conn.peer_certificates())
+    };
+    match presented {
+        Some(fp) if pure::fingerprints_equal(&fp, expected_fingerprint) => {}
+        _ => {
+            return Err(
+                "el puerto de carga presentó otro certificado que el del par pareado".into(),
+            )
+        }
+    }
 
     // Temporal oculto y único: no deriva de nada que el par controle, no pisa un
     // archivo del usuario y, si la transferencia falla, se borra sin dejar un
@@ -1147,7 +1176,13 @@ async fn stream_payload_to_file(
     size: u64,
     tmp: &std::path::Path,
 ) -> Result<(), String> {
-    let mut file = tokio::fs::File::create(tmp)
+    // `create_new` (O_EXCL) crea el temporal sólo si no existe: falla en vez de
+    // escribir a través de un symlink que una app local hostil haya plantado con
+    // ese nombre (el `.part` sin O_EXCL lo seguiría).
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(tmp)
         .await
         .map_err(|err| format!("no se pudo crear el temporal: {err}"))?;
     let mut remaining = size;
