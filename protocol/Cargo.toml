@@ -10,6 +10,13 @@ repository.workspace = true
 [dependencies]
 serde.workspace = true
 serde_json = "1"
+# Cripto pura que usa el módulo `pure` (compromiso y derivación del SAS, huellas,
+# comparación en tiempo constante). Todas compilan en Android/iOS; el DH efímero
+# (`ring`) lo hace cada punta, no este crate. Mismas versiones que el daemon.
+sha2 = "0.10"
+hkdf = "0.12"
+subtle = "2"
+hex = "0.4"
 # `zbus` es sólo del contrato de D-Bus (daemon↔paneles). El módulo `wire` no lo
 # usa, así que queda detrás de la feature `dbus` (activa por omisión): la app
 # móvil depende con `default-features = false` y se lleva sólo `wire`, sin zbus
@@ -19,3 +26,10 @@ zbus = { workspace = true, optional = true }
 [features]
 default = ["dbus"]
 dbus = ["dep:zbus"]
+
+[dev-dependencies]
+# Sólo para las pruebas del pareo: generan claves DH efímeras reales para
+# alimentar `derive_sas`. El crate en sí no hace el DH —cada punta lo hace y le
+# pasa el secreto compartido ya calculado—, así que `ring` no entra en el grafo
+# de quien lo consume.
+ring = "0.17"

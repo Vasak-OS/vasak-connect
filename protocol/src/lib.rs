@@ -11,6 +11,16 @@
 /// `zbus` —que no compila en Android/iOS—.
 pub mod wire;
 
+/// La lógica del canal que se decide **sin** red, TLS, D-Bus ni llavero: huellas,
+/// framing, pinning del certificado, el compromiso y la derivación del SAS, y la
+/// máquina de estados del pareo. Vive acá —y no sólo en el daemon— porque las dos
+/// puntas corren la misma: la app móvil la reúsa en vez de reimplementar código de
+/// seguridad que, si difiere en un bit, rompe o debilita el pareo. Sólo depende de
+/// `wire` y de cripto pura (`sha2`, `hkdf`, `subtle`, `hex`), que compila en
+/// Android/iOS; el DH efímero (`ring::agreement`) lo hace cada punta y le pasa a
+/// [`pure::derive_sas`] el secreto compartido ya calculado.
+pub mod pure;
+
 #[cfg(feature = "dbus")]
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "dbus")]

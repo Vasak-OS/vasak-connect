@@ -1854,7 +1854,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vasak-connect-daemon"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "bytes",
  "dirs",
@@ -1886,10 +1886,15 @@ dependencies = [
 
 [[package]]
 name = "vasak-connect-protocol"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
+ "hex",
+ "hkdf",
+ "ring",
  "serde",
  "serde_json",
+ "sha2",
+ "subtle",
  "zbus",
 ]
 
