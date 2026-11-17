@@ -1998,4 +1998,161 @@ mod tests {
         assert!(action.abort);
         assert_eq!(action.next, PairingState::Idle);
     }
+
+    /// Una identidad real (cert autofirmado + clave) para levantar TLS de verdad.
+    fn real_identity() -> Identity {
+        let certified = rcgen::generate_simple_self_signed(vec!["vasak-connect".to_string()])
+            .expect("rcgen debe generar el certificado");
+        let cert_der = certified.cert.der().to_vec();
+        Identity {
+            fingerprint: pure::fingerprint_from_der(&cert_der),
+            cert_der: CertificateDer::from(cert_der),
+            key_der: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+                certified.signing_key.serialize_der(),
+            )),
+            device_id: "servidor".into(),
+        }
+    }
+
+    /// Carpeta temporal única, borrada por quien la pide al terminar.
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("vsk-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Un "teléfono" TLS en localhost que presenta `server` y manda `body` en el
+    /// puerto de carga. Devuelve el puerto.
+    async fn spawn_payload_server(server: Identity, body: Vec<u8>) -> u16 {
+        let acceptor = TlsAcceptor::from(Arc::new(transport::server_config(&server).unwrap()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((tcp, _)) = listener.accept().await {
+                if let Ok(mut tls) = acceptor.accept(tcp).await {
+                    let _ = tls.write_all(&body).await;
+                    let _ = tls.shutdown().await;
+                }
+            }
+        });
+        port
+    }
+
+    fn offer(port: u16, size: u64) -> FileOffer {
+        FileOffer {
+            id: "t1".into(),
+            name: "foto.jpg".into(),
+            size,
+            mime: String::new(),
+            payload_port: port,
+        }
+    }
+
+    fn only_files(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// Un solo test porque redirige `XDG_CONFIG_HOME` (proceso entero) para que
+    /// `dirs::download_dir()` caiga en una carpeta de prueba; en dos tests en
+    /// paralelo se pisarían.
+    #[tokio::test]
+    async fn el_puerto_de_carga_con_otra_huella_no_deja_ningun_archivo() {
+        let cfg = scratch_dir("cfg");
+        let downloads = scratch_dir("descargas");
+        std::fs::write(
+            cfg.join("user-dirs.dirs"),
+            format!("XDG_DOWNLOAD_DIR=\"{}\"\n", downloads.display()),
+        )
+        .unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &cfg);
+        assert_eq!(
+            dirs::download_dir().as_deref(),
+            Some(downloads.as_path()),
+            "la redirección de la carpeta de descargas debe funcionar"
+        );
+
+        let client = real_identity();
+        let (mut s, _rx) = session(true, 1);
+        s.fingerprint = String::new();
+        let mut rt = runtime(vec![("par", s)]);
+        rt.identity = Arc::new(client);
+        let state = Arc::new(Mutex::new(State {
+            devices: HashMap::new(),
+            apps: HashMap::new(),
+            cameras: HashMap::new(),
+            windows: Default::default(),
+            webcam: Default::default(),
+            registry: Default::default(),
+            channel: Some(rt),
+        }));
+        let loopback: IpAddr = std::net::Ipv4Addr::LOCALHOST.into();
+
+        // Atacante: otro certificado que el fijado para el par.
+        let pinned = real_identity();
+        let impostor = real_identity();
+        let port = spawn_payload_server(impostor, b"hola".to_vec()).await;
+        let res = download_file(
+            &offer(port, 4),
+            "foto.jpg",
+            loopback,
+            &pinned.fingerprint,
+            &state,
+        )
+        .await;
+        assert!(res.is_err(), "otra huella debe cortar la descarga: {res:?}");
+        assert!(
+            only_files(&downloads).is_empty(),
+            "no debe quedar ningún archivo: {:?}",
+            only_files(&downloads)
+        );
+
+        // Control: con la huella correcta el mismo montaje sí escribe (si no, la
+        // prueba de arriba sería vacía).
+        let port = spawn_payload_server(pinned_clone(&pinned), b"hola".to_vec()).await;
+        let path = download_file(
+            &offer(port, 4),
+            "foto.jpg",
+            loopback,
+            &pinned.fingerprint,
+            &state,
+        )
+        .await
+        .expect("con la huella fijada debe recibir");
+        assert_eq!(std::fs::read(path).unwrap(), b"hola");
+
+        let _ = std::fs::remove_dir_all(&cfg);
+        let _ = std::fs::remove_dir_all(&downloads);
+    }
+
+    fn pinned_clone(i: &Identity) -> Identity {
+        Identity {
+            cert_der: i.cert_der.clone(),
+            key_der: i.key_der.clone_key(),
+            fingerprint: i.fingerprint.clone(),
+            device_id: i.device_id.clone(),
+        }
+    }
+
+    #[tokio::test]
+    async fn el_temporal_no_sigue_un_symlink_plantado() {
+        let dir = scratch_dir("symlink");
+        let victim = dir.join("victima.txt");
+        std::fs::write(&victim, b"intacto").unwrap();
+        let tmp = dir.join(".vsk-connect-0.part");
+        std::os::unix::fs::symlink(&victim, &tmp).unwrap();
+
+        let mut body: &[u8] = b"hola";
+        let res = stream_payload_to_file(&mut body, 4, &tmp).await;
+
+        assert!(res.is_err(), "O_EXCL debe fallar ante un symlink: {res:?}");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"intacto");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
