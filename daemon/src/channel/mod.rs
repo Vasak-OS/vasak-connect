@@ -992,7 +992,7 @@ where
                     // sostiene hasta terminar. Sin permiso se rechaza en vez de
                     // encolar, para no dejar que un par abra transferencias sin fin.
                     match (
-                        session_peer_endpoint(state, device_id).await,
+                        session_peer_endpoint(state, device_id, session_id).await,
                         file_transfer_permit(state).await,
                     ) {
                         (Some((peer_ip, fingerprint)), Some(permit)) => {
@@ -1063,17 +1063,22 @@ async fn set_session_battery(state: &Arc<Mutex<State>>, device_id: &str, status:
 /// La IP y la huella del certificado del par en la sesión abierta con ese
 /// `device_id`: a dónde discar el puerto de carga de un `FileOffer` y contra qué
 /// huella comparar el certificado que ese puerto presente. `None` si no hay
-/// sesión.
+/// sesión, **o si la que hay ya no es la que atiende la oferta** (`session_id`
+/// distinto): si entró una conexión de reemplazo con el mismo `device_id` entre
+/// que llegó la oferta y este lookup, es de otra conexión con otra IP, y discar a
+/// ésa recibiría el archivo de la oferta vieja por la sesión nueva. Mejor ignorar
+/// la oferta de la sesión reemplazada.
 async fn session_peer_endpoint(
     state: &Arc<Mutex<State>>,
     device_id: &str,
+    session_id: u64,
 ) -> Option<(IpAddr, String)> {
     let guard = state.lock().await;
-    guard
-        .channel
-        .as_ref()
-        .and_then(|ch| ch.sessions.get(device_id))
-        .map(|session| (session.peer_ip, session.fingerprint.clone()))
+    let session = guard.channel.as_ref()?.sessions.get(device_id)?;
+    if !owns_session_slot(Some(session.session_id), session_id) {
+        return None;
+    }
+    Some((session.peer_ip, session.fingerprint.clone()))
 }
 
 /// Toma un permiso del semáforo de transferencias de carga, o `None` si ya se

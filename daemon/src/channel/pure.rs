@@ -865,6 +865,15 @@ pub fn numbered_filename(name: &str, n: u32) -> String {
         Some((stem, ext)) if !stem.is_empty() => (stem, format!(".{ext}")),
         _ => (name, String::new()),
     };
+    // Con una extensión larguísima, el sufijo y la extensión por sí solos ya
+    // pasarían el límite: no se puede conservar la extensión sin excederse, así que
+    // se trata todo el nombre como base y se trunca el conjunto. El resultado queda
+    // siempre ≤ el límite. Con una extensión corta —el caso normal— no cambia nada.
+    let (base, tail) = if suffix.len() + tail.len() > MAX_FILENAME_BYTES {
+        (name, String::new())
+    } else {
+        (base, tail)
+    };
     let budget = MAX_FILENAME_BYTES.saturating_sub(suffix.len() + tail.len());
     format!("{}{suffix}{tail}", truncate_to_bytes(base, budget))
 }
