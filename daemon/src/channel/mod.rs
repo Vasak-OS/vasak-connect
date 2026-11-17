@@ -102,6 +102,14 @@ const PAYLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// cada transferencia.
 const PAYLOAD_TRAILER_GRACE: Duration = Duration::from_secs(3);
 
+/// Tope de transferencias de carga en vuelo a la vez. Cada una mantiene un
+/// socket, un temporal y un buffer de 64 KiB vivos (y un par pareado puede
+/// mantenerlas con un byte cada tanto), y el semáforo de la sesión de control no
+/// las cubre. 4 alcanza para recibir varios archivos a la vez sin dejar que un
+/// par abra miles; una de más se rechaza con `FileResult { ok: false }` en vez
+/// de encolarse.
+const MAX_CONCURRENT_FILE_TRANSFERS: usize = 4;
+
 /// Lo que un par anunció por mDNS y dónde alcanzarlo.
 pub struct Discovered {
     pub peer: PeerInfo,
@@ -164,6 +172,10 @@ pub struct ChannelRuntime {
     pub discovered: HashMap<String, Discovered>,
     sessions: HashMap<String, Session>,
     commands: mpsc::UnboundedSender<Command>,
+    /// Acota las transferencias de carga en vuelo (ver
+    /// [`MAX_CONCURRENT_FILE_TRANSFERS`]). Cada recepción toma un permiso antes de
+    /// spawnear y lo suelta al terminar.
+    file_transfers: Arc<Semaphore>,
 }
 
 impl ChannelRuntime {
@@ -350,6 +362,7 @@ pub async fn run(connection: zbus::Connection, state: Arc<Mutex<State>>) {
             discovered: HashMap::new(),
             sessions: HashMap::new(),
             commands: command_tx,
+            file_transfers: Arc::new(Semaphore::new(MAX_CONCURRENT_FILE_TRANSFERS)),
         });
     }
 
@@ -974,18 +987,37 @@ where
                 // transferencia; esa tarea contesta el `FileResult` por el canal de
                 // salida al terminar.
                 pure::FileOfferDecision::Accept { filename } => {
-                    if let Some((peer_ip, fingerprint)) =
-                        session_peer_endpoint(state, device_id).await
-                    {
-                        tokio::spawn(receive_file(
-                            offer,
-                            filename,
-                            peer_ip,
-                            fingerprint,
-                            device_id.to_string(),
-                            state.clone(),
-                            connection.clone(),
-                        ));
+                    // Un permiso del semáforo de transferencias acota las que
+                    // corren a la vez; se toma antes de spawnear y la tarea lo
+                    // sostiene hasta terminar. Sin permiso se rechaza en vez de
+                    // encolar, para no dejar que un par abra transferencias sin fin.
+                    match (
+                        session_peer_endpoint(state, device_id).await,
+                        file_transfer_permit(state).await,
+                    ) {
+                        (Some((peer_ip, fingerprint)), Some(permit)) => {
+                            tokio::spawn(receive_file(
+                                offer,
+                                filename,
+                                peer_ip,
+                                fingerprint,
+                                permit,
+                                device_id.to_string(),
+                                state.clone(),
+                                connection.clone(),
+                            ));
+                        }
+                        (Some(_), None) => {
+                            let _ = send_with_deadline(
+                                writer,
+                                &Message::FileResult {
+                                    id: offer.id,
+                                    ok: false,
+                                },
+                            )
+                            .await;
+                        }
+                        (None, _) => {}
                     }
                 }
             }
@@ -1044,25 +1076,47 @@ async fn session_peer_endpoint(
         .map(|session| (session.peer_ip, session.fingerprint.clone()))
 }
 
+/// Toma un permiso del semáforo de transferencias de carga, o `None` si ya se
+/// alcanzó el tope ([`MAX_CONCURRENT_FILE_TRANSFERS`]) o no hay canal. No espera:
+/// una transferencia de más se rechaza en vez de encolarse.
+async fn file_transfer_permit(
+    state: &Arc<Mutex<State>>,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    let guard = state.lock().await;
+    let semaphore = guard.channel.as_ref()?.file_transfers.clone();
+    semaphore.try_acquire_owned().ok()
+}
+
 /// Recibe un archivo ofrecido por un par pareado: lo baja, emite la señal de
 /// D-Bus si salió bien y, en todo caso, le contesta al par con el `FileResult`
 /// por la sesión de control. Corre en su propia tarea para no bloquear el bucle
 /// de la sesión durante la transferencia.
+#[allow(clippy::too_many_arguments)]
 async fn receive_file(
     offer: FileOffer,
     filename: String,
     peer_ip: IpAddr,
     expected_fingerprint: String,
+    // El permiso del semáforo de transferencias: se sostiene mientras dura la
+    // recepción y se suelta al terminar la tarea.
+    _permit: tokio::sync::OwnedSemaphorePermit,
     device_id: String,
     state: Arc<Mutex<State>>,
     connection: zbus::Connection,
 ) {
     let ok = match download_file(&offer, &filename, peer_ip, &expected_fingerprint, &state).await {
         Ok(path) => {
-            info!(%device_id, file = %filename, "archivo recibido");
+            // El nombre final puede diferir del propuesto si hubo que desambiguar
+            // (`foto (1).jpg`): se saca de la ruta para que la señal y el archivo
+            // coincidan.
+            let final_name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| filename.clone());
+            info!(%device_id, file = %final_name, "archivo recibido");
             // El daemon no abre el archivo ni toca el escritorio: sólo avisa el
             // nombre y la ruta final para que otro decida qué hacer.
-            emit_file_received(&connection, &filename, &path.to_string_lossy()).await;
+            emit_file_received(&connection, &final_name, &path.to_string_lossy()).await;
             true
         }
         Err(err) => {
@@ -1133,44 +1187,47 @@ async fn download_file(
         }
     }
 
-    // Temporal oculto y único: no deriva de nada que el par controle, no pisa un
-    // archivo del usuario y, si la transferencia falla, se borra sin dejar un
-    // archivo a medias con el nombre final.
+    // Temporal oculto y único: no deriva de nada que el par controle.
+    // `stream_payload_to_file` lo abre con O_EXCL y, si lo creó, lo borra ante
+    // cualquier error; si la apertura falla porque el `.part` ya existe (no es
+    // nuestro: un leftover o un symlink plantado), vuelve con error sin tocarlo.
     let part = NEXT_PART_ID.fetch_add(1, Ordering::Relaxed);
     let tmp = dir.join(format!(".vsk-connect-{part}.part"));
+    stream_payload_to_file(&mut tls, offer.size, &tmp).await?;
 
-    if let Err(err) = stream_payload_to_file(&mut tls, offer.size, &tmp).await {
-        let _ = tokio::fs::remove_file(&tmp).await;
-        return Err(err);
-    }
-
-    // Nombre final saneado; si ya existe, se desambigua con un sufijo en vez de
-    // pisarlo en silencio.
-    let final_path = {
-        let mut n = 0u32;
-        loop {
-            let candidate = dir.join(pure::numbered_filename(filename, n));
-            if !tokio::fs::try_exists(&candidate).await.unwrap_or(false) {
-                break candidate;
+    // Publicado atómico sin reemplazo: `hard_link` crea el nombre final apuntando
+    // al mismo inodo que el temporal (misma carpeta, mismo FS) y **falla con
+    // `AlreadyExists`** si el destino ya existe —así dos transferencias del mismo
+    // nombre no se pisan, cosa que un `try_exists` + `rename` no evita por la
+    // carrera—. Tampoco sigue un symlink en el destino. En colisión se prueba el
+    // siguiente nombre numerado; al enlazar bien, se borra el temporal.
+    let mut n = 0u32;
+    let final_path = loop {
+        let candidate = dir.join(pure::numbered_filename(filename, n));
+        match tokio::fs::hard_link(&tmp, &candidate).await {
+            Ok(()) => break candidate,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                n += 1;
+                if n > 10_000 {
+                    let _ = tokio::fs::remove_file(&tmp).await;
+                    return Err("demasiados archivos con ese nombre en descargas".into());
+                }
             }
-            n += 1;
-            if n > 10_000 {
+            Err(err) => {
                 let _ = tokio::fs::remove_file(&tmp).await;
-                return Err("demasiados archivos con ese nombre en descargas".into());
+                return Err(format!("no se pudo publicar el archivo: {err}"));
             }
         }
     };
-    if let Err(err) = tokio::fs::rename(&tmp, &final_path).await {
-        let _ = tokio::fs::remove_file(&tmp).await;
-        return Err(format!("no se pudo mover el archivo a su destino: {err}"));
-    }
+    let _ = tokio::fs::remove_file(&tmp).await;
     Ok(final_path)
 }
 
-/// Lee exactamente `size` bytes de `reader` y los escribe a `tmp`, en trozos para
-/// no cargar el archivo entero en memoria. Falla si el par cierra antes (cuerpo
-/// corto), si manda de más (cuerpo largo) o si deja de enviar más de
-/// [`PAYLOAD_IDLE_TIMEOUT`] (se da por muerta).
+/// Abre el temporal con O_EXCL y recibe en él exactamente `size` bytes. Devuelve
+/// error sin tocar nada si la apertura falla porque el `.part` ya existe —no es
+/// nuestro: un leftover o un symlink plantado que O_EXCL se niega a seguir— y, si
+/// el temporal **sí** lo creó esta transferencia, lo borra ante cualquier error de
+/// la recepción, para no dejar un archivo a medias.
 async fn stream_payload_to_file(
     reader: &mut (impl AsyncReadExt + Unpin),
     size: u64,
@@ -1178,13 +1235,33 @@ async fn stream_payload_to_file(
 ) -> Result<(), String> {
     // `create_new` (O_EXCL) crea el temporal sólo si no existe: falla en vez de
     // escribir a través de un symlink que una app local hostil haya plantado con
-    // ese nombre (el `.part` sin O_EXCL lo seguiría).
-    let mut file = tokio::fs::OpenOptions::new()
+    // ese nombre predecible. Si falla acá el archivo no es nuestro, así que se
+    // vuelve con error **antes** de que haya nada que limpiar.
+    let file = tokio::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(tmp)
         .await
         .map_err(|err| format!("no se pudo crear el temporal: {err}"))?;
+    // De acá en más el temporal es nuestro: si la recepción falla, se borra.
+    match write_payload(file, reader, size).await {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let _ = tokio::fs::remove_file(tmp).await;
+            Err(err)
+        }
+    }
+}
+
+/// Recibe exactamente `size` bytes de `reader` al `file` ya abierto, en trozos para
+/// no cargar el archivo entero en memoria. Falla si el par cierra antes (cuerpo
+/// corto), si manda de más (cuerpo largo) o si deja de enviar más de
+/// [`PAYLOAD_IDLE_TIMEOUT`] (se da por muerta).
+async fn write_payload(
+    mut file: tokio::fs::File,
+    reader: &mut (impl AsyncReadExt + Unpin),
+    size: u64,
+) -> Result<(), String> {
     let mut remaining = size;
     let mut buf = [0u8; 64 * 1024];
     while remaining > 0 {
@@ -1879,6 +1956,7 @@ mod tests {
                 .map(|(id, s)| (id.to_string(), s))
                 .collect(),
             commands,
+            file_transfers: Arc::new(Semaphore::new(MAX_CONCURRENT_FILE_TRANSFERS)),
         }
     }
 

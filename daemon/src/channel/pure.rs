@@ -780,6 +780,11 @@ pub fn accept_incoming_clipboard(paired: bool, text: String) -> Option<String> {
 /// falta un límite por espacio libre real o configurable, lo ajusta security.
 pub const MAX_FILE_SIZE: u64 = 2 * 1024 * 1024 * 1024;
 
+/// Largo máximo de un componente de nombre de archivo, en bytes. Es el límite
+/// típico (255) de la mayoría de los sistemas de archivos; un nombre más largo
+/// haría fallar la apertura o el enlace.
+const MAX_FILENAME_BYTES: usize = 255;
+
 /// Qué hacer con un `FileOffer` entrante, decidido sin tocar la red ni el disco.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileOfferDecision {
@@ -806,10 +811,9 @@ pub fn sanitize_incoming_filename(name: &str) -> Option<String> {
     if name.is_empty() {
         return None;
     }
-    // 255 bytes es el límite típico de un nombre en la mayoría de los sistemas de
-    // archivos; un nombre más largo sólo haría fallar el `create`, así que se
-    // rechaza acá, donde se puede probar.
-    if name.len() > 255 {
+    // Un nombre más largo que el límite del FS ([`MAX_FILENAME_BYTES`]) sólo haría
+    // fallar el `create`, así que se rechaza acá, donde se puede probar.
+    if name.len() > MAX_FILENAME_BYTES {
         return None;
     }
     // Separadores de ruta (incluido `\` por defensa en profundidad) y caracteres
@@ -845,16 +849,37 @@ pub fn decide_incoming_file(paired: bool, name: &str, size: u64) -> FileOfferDec
 /// extensión en los siguientes. Pura para poder probar la desambiguación sin
 /// tocar el disco; el bucle que mira si existe cada candidato vive en el código
 /// async.
+///
+/// El resultado nunca pasa [`MAX_FILENAME_BYTES`]: si el sufijo lo haría pasar, se
+/// acorta la base (nunca el sufijo ni la extensión) en un borde de carácter UTF-8,
+/// porque un nombre de 255 bytes más ` (1)` daría 259 y la apertura o el enlace
+/// fallarían.
 pub fn numbered_filename(name: &str, n: u32) -> String {
     if n == 0 {
         return name.to_string();
     }
-    match name.rsplit_once('.') {
+    let suffix = format!(" ({n})");
+    let (base, tail) = match name.rsplit_once('.') {
         // Sólo se trata el punto como separador de extensión si hay algo antes
         // (un oculto como `.bashrc` lleva el sufijo al final, no en medio).
-        Some((stem, ext)) if !stem.is_empty() => format!("{stem} ({n}).{ext}"),
-        _ => format!("{name} ({n})"),
+        Some((stem, ext)) if !stem.is_empty() => (stem, format!(".{ext}")),
+        _ => (name, String::new()),
+    };
+    let budget = MAX_FILENAME_BYTES.saturating_sub(suffix.len() + tail.len());
+    format!("{}{suffix}{tail}", truncate_to_bytes(base, budget))
+}
+
+/// El prefijo más largo de `s` que entra en `max` bytes sin partir un carácter
+/// multibyte.
+fn truncate_to_bytes(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
     }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 #[cfg(test)]
