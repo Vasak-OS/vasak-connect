@@ -1488,4 +1488,122 @@ mod tests {
     fn el_portapapeles_vacio_de_un_par_pareado_se_ignora() {
         assert_eq!(accept_incoming_clipboard(true, String::new()), None);
     }
+
+    #[test]
+    fn un_nombre_simple_de_archivo_se_acepta_tal_cual() {
+        assert_eq!(
+            sanitize_incoming_filename("foto.jpg"),
+            Some("foto.jpg".to_string())
+        );
+        assert_eq!(
+            sanitize_incoming_filename(".bashrc"),
+            Some(".bashrc".to_string())
+        );
+    }
+
+    #[test]
+    fn un_nombre_con_recorrido_de_ruta_se_rechaza() {
+        for malo in ["..", ".", "../x", "a/b", "a\\b", "/etc/passwd", "C:\\x\\y"] {
+            assert_eq!(sanitize_incoming_filename(malo), None, "{malo:?}");
+        }
+    }
+
+    #[test]
+    fn un_nombre_con_nul_o_caracteres_de_control_se_rechaza() {
+        for malo in ["a\0b", "a\nb", "a\tb", "\u{7f}x"] {
+            assert_eq!(sanitize_incoming_filename(malo), None, "{malo:?}");
+        }
+    }
+
+    #[test]
+    fn un_nombre_vacio_se_rechaza() {
+        assert_eq!(sanitize_incoming_filename(""), None);
+    }
+
+    #[test]
+    fn el_nombre_de_255_bytes_pasa_y_el_de_256_no() {
+        assert!(sanitize_incoming_filename(&"a".repeat(255)).is_some());
+        assert_eq!(sanitize_incoming_filename(&"a".repeat(256)), None);
+        // El límite es en bytes, no en caracteres: 128 'ñ' son 256 bytes.
+        assert_eq!(sanitize_incoming_filename(&"ñ".repeat(128)), None);
+    }
+
+    #[test]
+    fn una_oferta_de_un_par_sin_parear_se_ignora_aunque_sea_valida() {
+        assert_eq!(
+            decide_incoming_file(false, "foto.jpg", 10),
+            FileOfferDecision::Ignore
+        );
+        // Ni siquiera un nombre malo o un tamaño excesivo se contesta.
+        assert_eq!(
+            decide_incoming_file(false, "../x", u64::MAX),
+            FileOfferDecision::Ignore
+        );
+    }
+
+    #[test]
+    fn una_oferta_pareada_valida_se_acepta_con_el_nombre_saneado() {
+        assert_eq!(
+            decide_incoming_file(true, "foto.jpg", 10),
+            FileOfferDecision::Accept {
+                filename: "foto.jpg".into()
+            }
+        );
+        assert_eq!(
+            decide_incoming_file(true, "vacio", 0),
+            FileOfferDecision::Accept {
+                filename: "vacio".into()
+            }
+        );
+    }
+
+    #[test]
+    fn una_oferta_pareada_con_nombre_inseguro_se_rechaza() {
+        assert_eq!(
+            decide_incoming_file(true, "../x", 10),
+            FileOfferDecision::Reject
+        );
+    }
+
+    #[test]
+    fn una_oferta_pareada_sobre_el_tope_se_rechaza_y_en_el_tope_se_acepta() {
+        assert_eq!(
+            decide_incoming_file(true, "a", MAX_FILE_SIZE),
+            FileOfferDecision::Accept {
+                filename: "a".into()
+            }
+        );
+        assert_eq!(
+            decide_incoming_file(true, "a", MAX_FILE_SIZE + 1),
+            FileOfferDecision::Reject
+        );
+        assert_eq!(MAX_FILE_SIZE, 2 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn el_intento_cero_conserva_el_nombre() {
+        assert_eq!(numbered_filename("foto.jpg", 0), "foto.jpg");
+        assert_eq!(numbered_filename("README", 0), "README");
+    }
+
+    #[test]
+    fn el_sufijo_numerado_va_antes_de_la_extension() {
+        assert_eq!(numbered_filename("foto.jpg", 1), "foto (1).jpg");
+        assert_eq!(numbered_filename("foto.jpg", 12), "foto (12).jpg");
+    }
+
+    #[test]
+    fn un_nombre_sin_extension_lleva_el_sufijo_al_final() {
+        assert_eq!(numbered_filename("README", 2), "README (2)");
+    }
+
+    #[test]
+    fn con_varios_puntos_la_extension_es_la_ultima() {
+        assert_eq!(numbered_filename("a.tar.gz", 1), "a.tar (1).gz");
+    }
+
+    #[test]
+    fn un_oculto_sin_extension_lleva_el_sufijo_al_final() {
+        assert_eq!(numbered_filename(".bashrc", 1), ".bashrc (1)");
+    }
 }
