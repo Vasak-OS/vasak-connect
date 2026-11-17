@@ -538,6 +538,13 @@ impl ConnectService {
     /// Un par pareado copió texto; el escritorio lo aplica al portapapeles local.
     #[zbus(signal)]
     async fn clipboard_received(emitter: &SignalEmitter<'_>, text: &str) -> zbus::Result<()>;
+
+    /// Un par pareado envió un archivo, ya recibido y guardado en la carpeta de
+    /// descargas. Trae el nombre final y la ruta; el escritorio o la galería
+    /// deciden qué hacer, el daemon no abre el archivo.
+    #[zbus(signal)]
+    async fn file_received(emitter: &SignalEmitter<'_>, name: &str, path: &str)
+        -> zbus::Result<()>;
 }
 
 pub(crate) fn now_iso8601() -> String {

@@ -16,13 +16,14 @@ pub mod pure;
 pub mod transport;
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use ring::agreement;
 use ring::rand::SystemRandom;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::time::{interval, timeout};
@@ -31,7 +32,7 @@ use tokio_stream::StreamExt;
 use tokio_util::codec::FramedRead;
 use tracing::{debug, info, warn};
 use vasak_connect_protocol::wire::{
-    BatteryStatus, DeviceKind, Message, PeerInfo, PROTOCOL_VERSION,
+    BatteryStatus, DeviceKind, FileOffer, Message, PeerInfo, PROTOCOL_VERSION,
 };
 
 use crate::{notify, State};
@@ -46,6 +47,11 @@ use transport::{peer_fingerprint, read_frame, write_frame, MessageDecoder, Sessi
 /// Numerador de sesiones: le da a cada `handle_session` un id único, para que la
 /// limpieza de una sesión vieja no toque la entrada de una de reemplazo.
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Numerador de temporales de descarga: le da a cada archivo entrante un nombre
+/// `.part` único y propio, para que dos transferencias a la vez no se pisen y
+/// para no derivar el temporal de nada que el par controle.
+static NEXT_PART_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Cada cuánto se manda un `Ping` para mantener viva la sesión y notar un corte
 /// que el socket todavía no reportó.
@@ -84,6 +90,26 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// sesiones a medio parear para siempre.
 const PAIR_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Cuánto se espera cada trozo de un archivo entrante antes de dar la
+/// transferencia por muerta. Es un plazo de inactividad —se reinicia con cada
+/// trozo que llega—, no un tope del total: así un archivo grande por un enlace
+/// lento no se corta, pero un par que deja de enviar no deja la tarea colgada.
+const PAYLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Cuánto se espera, ya leídos los `size` bytes, a que el par cierre su lado. Un
+/// emisor correcto cierra y el `Ok(0)` llega al toque; este plazo corto sólo
+/// acota la ventana para notar un cuerpo más largo que el anunciado sin demorar
+/// cada transferencia.
+const PAYLOAD_TRAILER_GRACE: Duration = Duration::from_secs(3);
+
+/// Tope de transferencias de carga en vuelo a la vez. Cada una mantiene un
+/// socket, un temporal y un buffer de 64 KiB vivos (y un par pareado puede
+/// mantenerlas con un byte cada tanto), y el semáforo de la sesión de control no
+/// las cubre. 4 alcanza para recibir varios archivos a la vez sin dejar que un
+/// par abra miles; una de más se rechaza con `FileResult { ok: false }` en vez
+/// de encolarse.
+const MAX_CONCURRENT_FILE_TRANSFERS: usize = 4;
+
 /// Lo que un par anunció por mDNS y dónde alcanzarlo.
 pub struct Discovered {
     pub peer: PeerInfo,
@@ -107,6 +133,10 @@ pub struct Session {
     /// La huella del certificado del par en esta sesión, para fijarla si se
     /// confirma el pareo sin volver a bajar a la capa de TLS.
     pub fingerprint: String,
+    /// La IP del par en esta sesión. Es a donde se disca el puerto de carga de un
+    /// `FileOffer` (el par se saca de `discovered` al abrir la sesión, así que su
+    /// dirección se guarda acá).
+    peer_ip: IpAddr,
     pub paired: bool,
     /// El estado del pareo de esta sesión. Toda la lógica pasa por
     /// [`advance_pairing`]: fijar al par depende de este estado, no de un mensaje
@@ -142,6 +172,10 @@ pub struct ChannelRuntime {
     pub discovered: HashMap<String, Discovered>,
     sessions: HashMap<String, Session>,
     commands: mpsc::UnboundedSender<Command>,
+    /// Acota las transferencias de carga en vuelo (ver
+    /// [`MAX_CONCURRENT_FILE_TRANSFERS`]). Cada recepción toma un permiso antes de
+    /// spawnear y lo suelta al terminar.
+    file_transfers: Arc<Semaphore>,
 }
 
 impl ChannelRuntime {
@@ -328,6 +362,7 @@ pub async fn run(connection: zbus::Connection, state: Arc<Mutex<State>>) {
             discovered: HashMap::new(),
             sessions: HashMap::new(),
             commands: command_tx,
+            file_transfers: Arc::new(Semaphore::new(MAX_CONCURRENT_FILE_TRANSFERS)),
         });
     }
 
@@ -368,7 +403,7 @@ pub async fn run(connection: zbus::Connection, state: Arc<Mutex<State>>) {
                                 Ok(Ok(tls)) => {
                                     let (_, server_conn) = tls.get_ref();
                                     let fingerprint = peer_fingerprint(server_conn.peer_certificates());
-                                    handle_session(tls, fingerprint, false, state, connection).await;
+                                    handle_session(tls, fingerprint, addr, false, state, connection).await;
                                 }
                                 Ok(Err(err)) => debug!(%err, "handshake entrante fallido"),
                                 Err(_) => debug!("handshake entrante sin completar a tiempo"),
@@ -460,7 +495,7 @@ async fn dial_and_pair(
     .map_err(|_| "el par no completó la conexión a tiempo")??;
     let (_, client_conn) = tls.get_ref();
     let fingerprint = peer_fingerprint(client_conn.peer_certificates());
-    handle_session(tls, fingerprint, true, state, connection).await;
+    handle_session(tls, fingerprint, address, true, state, connection).await;
     Ok(())
 }
 
@@ -472,6 +507,7 @@ async fn dial_and_pair(
 async fn handle_session<S>(
     tls: S,
     fingerprint: Option<String>,
+    peer_addr: SocketAddr,
     initiate_pair: bool,
     state: Arc<Mutex<State>>,
     connection: zbus::Connection,
@@ -591,6 +627,7 @@ async fn handle_session<S>(
                 name: peer.name.clone(),
                 kind: peer.kind,
                 fingerprint: fingerprint.clone(),
+                peer_ip: peer_addr.ip(),
                 paired,
                 pair: PairingState::Idle,
                 dh_secret: None,
@@ -924,12 +961,73 @@ where
             }
             true
         }
-        // La transferencia de archivos es de un PR posterior. El SAS con
-        // compromiso (RFC 6189) ya protege el primer pareo; falta sólo la
-        // transferencia en sí. Por ahora se reconoce y se ignora sin cerrar la
-        // sesión.
-        Message::FileOffer(_) | Message::FileResult { .. } => {
-            debug!(%device_id, "transferencia de archivos aún no implementada; se ignora");
+        Message::FileOffer(offer) => {
+            // Sólo de un par pareado, igual que la batería y el portapapeles. La
+            // puerta de confianza, el tope de tamaño y el saneo del nombre son
+            // puros ([`pure::decide_incoming_file`]); acá sólo se actúa sobre la
+            // decisión.
+            let paired = session_paired(state, device_id).await;
+            match pure::decide_incoming_file(paired, &offer.name, offer.size) {
+                // Sin parear: se ignora en silencio, sin confirmarle nada al par.
+                pure::FileOfferDecision::Ignore => {}
+                // Pareado pero el ofrecimiento no pasa (nombre inseguro o tamaño
+                // sobre el tope): se rechaza sin abrir ninguna conexión.
+                pure::FileOfferDecision::Reject => {
+                    let _ = send_with_deadline(
+                        writer,
+                        &Message::FileResult {
+                            id: offer.id,
+                            ok: false,
+                        },
+                    )
+                    .await;
+                }
+                // Pareado y válido: se recibe en una tarea aparte para no bloquear
+                // el bucle de la sesión (keepalive, cierre) durante la
+                // transferencia; esa tarea contesta el `FileResult` por el canal de
+                // salida al terminar.
+                pure::FileOfferDecision::Accept { filename } => {
+                    // Un permiso del semáforo de transferencias acota las que
+                    // corren a la vez; se toma antes de spawnear y la tarea lo
+                    // sostiene hasta terminar. Sin permiso se rechaza en vez de
+                    // encolar, para no dejar que un par abra transferencias sin fin.
+                    match (
+                        session_peer_endpoint(state, device_id, session_id).await,
+                        file_transfer_permit(state).await,
+                    ) {
+                        (Some((peer_ip, fingerprint)), Some(permit)) => {
+                            tokio::spawn(receive_file(
+                                offer,
+                                filename,
+                                peer_ip,
+                                fingerprint,
+                                permit,
+                                device_id.to_string(),
+                                state.clone(),
+                                connection.clone(),
+                            ));
+                        }
+                        (Some(_), None) => {
+                            let _ = send_with_deadline(
+                                writer,
+                                &Message::FileResult {
+                                    id: offer.id,
+                                    ok: false,
+                                },
+                            )
+                            .await;
+                        }
+                        (None, _) => {}
+                    }
+                }
+            }
+            true
+        }
+        // El `FileResult` es la respuesta a una transferencia **saliente** (el
+        // escritorio envía), que es de un PR posterior. Del lado receptor no hace
+        // falta: se reconoce y se ignora sin cerrar la sesión.
+        Message::FileResult { .. } => {
+            debug!(%device_id, "envío de archivos aún no implementado; se ignora el FileResult");
             true
         }
         // Un segundo `Hello` en la misma sesión no tiene sentido (ya se consumió en
@@ -960,6 +1058,245 @@ async fn set_session_battery(state: &Arc<Mutex<State>>, device_id: &str, status:
     {
         session.battery = Some(status);
     }
+}
+
+/// La IP y la huella del certificado del par en la sesión abierta con ese
+/// `device_id`: a dónde discar el puerto de carga de un `FileOffer` y contra qué
+/// huella comparar el certificado que ese puerto presente. `None` si no hay
+/// sesión, **o si la que hay ya no es la que atiende la oferta** (`session_id`
+/// distinto): si entró una conexión de reemplazo con el mismo `device_id` entre
+/// que llegó la oferta y este lookup, es de otra conexión con otra IP, y discar a
+/// ésa recibiría el archivo de la oferta vieja por la sesión nueva. Mejor ignorar
+/// la oferta de la sesión reemplazada.
+async fn session_peer_endpoint(
+    state: &Arc<Mutex<State>>,
+    device_id: &str,
+    session_id: u64,
+) -> Option<(IpAddr, String)> {
+    let guard = state.lock().await;
+    let session = guard.channel.as_ref()?.sessions.get(device_id)?;
+    if !owns_session_slot(Some(session.session_id), session_id) {
+        return None;
+    }
+    Some((session.peer_ip, session.fingerprint.clone()))
+}
+
+/// Toma un permiso del semáforo de transferencias de carga, o `None` si ya se
+/// alcanzó el tope ([`MAX_CONCURRENT_FILE_TRANSFERS`]) o no hay canal. No espera:
+/// una transferencia de más se rechaza en vez de encolarse.
+async fn file_transfer_permit(
+    state: &Arc<Mutex<State>>,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    let guard = state.lock().await;
+    let semaphore = guard.channel.as_ref()?.file_transfers.clone();
+    semaphore.try_acquire_owned().ok()
+}
+
+/// Recibe un archivo ofrecido por un par pareado: lo baja, emite la señal de
+/// D-Bus si salió bien y, en todo caso, le contesta al par con el `FileResult`
+/// por la sesión de control. Corre en su propia tarea para no bloquear el bucle
+/// de la sesión durante la transferencia.
+#[allow(clippy::too_many_arguments)]
+async fn receive_file(
+    offer: FileOffer,
+    filename: String,
+    peer_ip: IpAddr,
+    expected_fingerprint: String,
+    // El permiso del semáforo de transferencias: se sostiene mientras dura la
+    // recepción y se suelta al terminar la tarea.
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    device_id: String,
+    state: Arc<Mutex<State>>,
+    connection: zbus::Connection,
+) {
+    let ok = match download_file(&offer, &filename, peer_ip, &expected_fingerprint, &state).await {
+        Ok(path) => {
+            // El nombre final puede diferir del propuesto si hubo que desambiguar
+            // (`foto (1).jpg`): se saca de la ruta para que la señal y el archivo
+            // coincidan.
+            let final_name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| filename.clone());
+            info!(%device_id, file = %final_name, "archivo recibido");
+            // El daemon no abre el archivo ni toca el escritorio: sólo avisa el
+            // nombre y la ruta final para que otro decida qué hacer.
+            emit_file_received(&connection, &final_name, &path.to_string_lossy()).await;
+            true
+        }
+        Err(err) => {
+            debug!(%device_id, %err, "no se pudo recibir el archivo ofrecido");
+            false
+        }
+    };
+    let guard = state.lock().await;
+    if let Some(ch) = guard.channel.as_ref() {
+        ch.send_to(&device_id, Message::FileResult { id: offer.id, ok });
+    }
+}
+
+/// Baja los bytes de un `FileOffer`: disca el puerto de carga del par por el mismo
+/// TLS mutuo que la sesión de control, **comprueba que presente la misma huella
+/// fijada** que el par pareado, lee exactamente `size` bytes a un temporal y lo
+/// renombra al nombre final (desambiguado si ya existe). Devuelve la ruta final, o
+/// un error que deja `ok: false` y no deja ningún archivo a medias.
+async fn download_file(
+    offer: &FileOffer,
+    filename: &str,
+    peer_ip: IpAddr,
+    expected_fingerprint: &str,
+    state: &Arc<Mutex<State>>,
+) -> Result<std::path::PathBuf, String> {
+    let dir = dirs::download_dir().ok_or("no hay carpeta de descargas")?;
+
+    // Mismo TLS mutuo que el control: se arma el config de cliente desde la
+    // identidad del canal y se disca a la IP del par con el puerto de **carga**
+    // del offer (no el de control).
+    let identity = {
+        let guard = state.lock().await;
+        guard.channel.as_ref().map(|ch| ch.identity.clone())
+    }
+    .ok_or("el canal no está activo")?;
+    let client_cfg = transport::client_config(&identity)
+        .map_err(|err| format!("configuración TLS de carga inválida: {err}"))?;
+    let connector = TlsConnector::from(Arc::new(client_cfg));
+    // El nombre del servidor en el TLS no se valida (no hay CA, la confianza la da
+    // la huella del certificado), pero rustls pide uno bien formado.
+    let server_name = rustls_pki_types::ServerName::try_from("vasak-connect")
+        .map_err(|err| format!("nombre de servidor inválido: {err}"))?
+        .to_owned();
+    let addr = SocketAddr::new(peer_ip, offer.payload_port);
+    let mut tls = timeout(HANDSHAKE_TIMEOUT, async {
+        let tcp = TcpStream::connect(addr).await?;
+        connector.connect(server_name, tcp).await
+    })
+    .await
+    .map_err(|_| "la conexión de carga no se completó a tiempo".to_string())?
+    .map_err(|err| format!("no se pudo abrir la conexión de carga: {err}"))?;
+
+    // El verificador de TLS acepta cualquier certificado (la confianza es posterior
+    // al handshake, como en la ruta de control): acá se cierra el pinning. El puerto
+    // de carga tiene que presentar la **misma huella fijada** que el par pareado de
+    // la sesión de control; si no, es un atacante on-path que ganó la carrera a la
+    // IP:puerto, y se corta antes de abrir ningún archivo en descargas.
+    let presented = {
+        let (_, conn) = tls.get_ref();
+        peer_fingerprint(conn.peer_certificates())
+    };
+    match presented {
+        Some(fp) if pure::fingerprints_equal(&fp, expected_fingerprint) => {}
+        _ => {
+            return Err(
+                "el puerto de carga presentó otro certificado que el del par pareado".into(),
+            )
+        }
+    }
+
+    // Temporal oculto y único: no deriva de nada que el par controle.
+    // `stream_payload_to_file` lo abre con O_EXCL y, si lo creó, lo borra ante
+    // cualquier error; si la apertura falla porque el `.part` ya existe (no es
+    // nuestro: un leftover o un symlink plantado), vuelve con error sin tocarlo.
+    let part = NEXT_PART_ID.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!(".vsk-connect-{part}.part"));
+    stream_payload_to_file(&mut tls, offer.size, &tmp).await?;
+
+    // Publicado atómico sin reemplazo: `hard_link` crea el nombre final apuntando
+    // al mismo inodo que el temporal (misma carpeta, mismo FS) y **falla con
+    // `AlreadyExists`** si el destino ya existe —así dos transferencias del mismo
+    // nombre no se pisan, cosa que un `try_exists` + `rename` no evita por la
+    // carrera—. Tampoco sigue un symlink en el destino. En colisión se prueba el
+    // siguiente nombre numerado; al enlazar bien, se borra el temporal.
+    let mut n = 0u32;
+    let final_path = loop {
+        let candidate = dir.join(pure::numbered_filename(filename, n));
+        match tokio::fs::hard_link(&tmp, &candidate).await {
+            Ok(()) => break candidate,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                n += 1;
+                if n > 10_000 {
+                    let _ = tokio::fs::remove_file(&tmp).await;
+                    return Err("demasiados archivos con ese nombre en descargas".into());
+                }
+            }
+            Err(err) => {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                return Err(format!("no se pudo publicar el archivo: {err}"));
+            }
+        }
+    };
+    let _ = tokio::fs::remove_file(&tmp).await;
+    Ok(final_path)
+}
+
+/// Abre el temporal con O_EXCL y recibe en él exactamente `size` bytes. Devuelve
+/// error sin tocar nada si la apertura falla porque el `.part` ya existe —no es
+/// nuestro: un leftover o un symlink plantado que O_EXCL se niega a seguir— y, si
+/// el temporal **sí** lo creó esta transferencia, lo borra ante cualquier error de
+/// la recepción, para no dejar un archivo a medias.
+async fn stream_payload_to_file(
+    reader: &mut (impl AsyncReadExt + Unpin),
+    size: u64,
+    tmp: &std::path::Path,
+) -> Result<(), String> {
+    // `create_new` (O_EXCL) crea el temporal sólo si no existe: falla en vez de
+    // escribir a través de un symlink que una app local hostil haya plantado con
+    // ese nombre predecible. Si falla acá el archivo no es nuestro, así que se
+    // vuelve con error **antes** de que haya nada que limpiar.
+    let file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(tmp)
+        .await
+        .map_err(|err| format!("no se pudo crear el temporal: {err}"))?;
+    // De acá en más el temporal es nuestro: si la recepción falla, se borra.
+    match write_payload(file, reader, size).await {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let _ = tokio::fs::remove_file(tmp).await;
+            Err(err)
+        }
+    }
+}
+
+/// Recibe exactamente `size` bytes de `reader` al `file` ya abierto, en trozos para
+/// no cargar el archivo entero en memoria. Falla si el par cierra antes (cuerpo
+/// corto), si manda de más (cuerpo largo) o si deja de enviar más de
+/// [`PAYLOAD_IDLE_TIMEOUT`] (se da por muerta).
+async fn write_payload(
+    mut file: tokio::fs::File,
+    reader: &mut (impl AsyncReadExt + Unpin),
+    size: u64,
+) -> Result<(), String> {
+    let mut remaining = size;
+    let mut buf = [0u8; 64 * 1024];
+    while remaining > 0 {
+        let want = remaining.min(buf.len() as u64) as usize;
+        let n = match timeout(PAYLOAD_IDLE_TIMEOUT, reader.read(&mut buf[..want])).await {
+            Ok(Ok(n)) => n,
+            Ok(Err(err)) => return Err(format!("error al leer el payload: {err}")),
+            Err(_) => return Err("el par dejó de enviar: se agotó el tiempo".into()),
+        };
+        if n == 0 {
+            return Err("el par cerró antes de enviar todos los bytes anunciados".into());
+        }
+        file.write_all(&buf[..n])
+            .await
+            .map_err(|err| format!("no se pudo escribir el archivo: {err}"))?;
+        remaining -= n as u64;
+    }
+    // Ya están los `size` bytes: un emisor correcto cierra ahora. Si en una
+    // ventana corta todavía llegan bytes, el cuerpo es más largo que el anunciado
+    // y se rechaza; un cierre (`Ok(0)`) o el silencio dentro de esa ventana se
+    // toman como fin para no demorar cada transferencia.
+    match timeout(PAYLOAD_TRAILER_GRACE, reader.read(&mut buf[..1])).await {
+        Ok(Ok(0)) | Err(_) => {}
+        Ok(Ok(_)) => return Err("el par envió más bytes que los anunciados".into()),
+        Ok(Err(err)) => return Err(format!("error al cerrar el payload: {err}")),
+    }
+    file.flush()
+        .await
+        .map_err(|err| format!("no se pudo vaciar el temporal: {err}"))?;
+    Ok(())
 }
 
 /// Hace avanzar la máquina de pareo de una sesión con un evento y guarda el
@@ -1542,6 +1879,18 @@ async fn emit_clipboard_received(connection: &zbus::Connection, text: &str) {
     let _ = crate::ConnectService::clipboard_received(&emitter, text).await;
 }
 
+/// Emite la señal de que un par pareado envió un archivo, ya recibido y guardado.
+/// El escritorio o la galería deciden qué hacer con él; el daemon sólo avisa el
+/// nombre y la ruta final.
+async fn emit_file_received(connection: &zbus::Connection, name: &str, path: &str) {
+    let Ok(emitter) =
+        zbus::object_server::SignalEmitter::new(connection, vasak_connect_protocol::SERVICE_PATH)
+    else {
+        return;
+    };
+    let _ = crate::ConnectService::file_received(&emitter, name, path).await;
+}
+
 /// Manda el texto copiado en el escritorio a cada par pareado y conectado.
 /// Devuelve a cuántos llegó. Lo llama el escritorio por D-Bus cuando cambia el
 /// portapapeles local.
@@ -1584,6 +1933,7 @@ mod tests {
             name: "Pixel 8".into(),
             kind: DeviceKind::Phone,
             fingerprint: String::new(),
+            peer_ip: std::net::Ipv4Addr::LOCALHOST.into(),
             paired,
             pair: PairingState::default(),
             dh_secret: None,
@@ -1611,6 +1961,7 @@ mod tests {
                 .map(|(id, s)| (id.to_string(), s))
                 .collect(),
             commands,
+            file_transfers: Arc::new(Semaphore::new(MAX_CONCURRENT_FILE_TRANSFERS)),
         }
     }
 
@@ -1729,5 +2080,296 @@ mod tests {
 
         assert!(action.abort);
         assert_eq!(action.next, PairingState::Idle);
+    }
+
+    /// Una identidad real (cert autofirmado + clave) para levantar TLS de verdad.
+    fn real_identity() -> Identity {
+        let certified = rcgen::generate_simple_self_signed(vec!["vasak-connect".to_string()])
+            .expect("rcgen debe generar el certificado");
+        let cert_der = certified.cert.der().to_vec();
+        Identity {
+            fingerprint: pure::fingerprint_from_der(&cert_der),
+            cert_der: CertificateDer::from(cert_der),
+            key_der: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+                certified.signing_key.serialize_der(),
+            )),
+            device_id: "servidor".into(),
+        }
+    }
+
+    /// Carpeta temporal única, borrada por quien la pide al terminar.
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("vsk-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Un "teléfono" TLS en localhost que presenta `server` y manda `body` en el
+    /// puerto de carga. Devuelve el puerto.
+    async fn spawn_payload_server(server: Identity, body: Vec<u8>) -> u16 {
+        let acceptor = TlsAcceptor::from(Arc::new(transport::server_config(&server).unwrap()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((tcp, _)) = listener.accept().await {
+                if let Ok(mut tls) = acceptor.accept(tcp).await {
+                    let _ = tls.write_all(&body).await;
+                    let _ = tls.shutdown().await;
+                }
+            }
+        });
+        port
+    }
+
+    fn offer(port: u16, size: u64) -> FileOffer {
+        FileOffer {
+            id: "t1".into(),
+            name: "foto.jpg".into(),
+            size,
+            mime: String::new(),
+            payload_port: port,
+        }
+    }
+
+    fn only_files(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// Un solo test porque redirige `XDG_CONFIG_HOME` (proceso entero) para que
+    /// `dirs::download_dir()` caiga en una carpeta de prueba; en dos tests en
+    /// paralelo se pisarían.
+    #[tokio::test]
+    async fn el_puerto_de_carga_con_otra_huella_no_deja_ningun_archivo() {
+        let _env = ENV_LOCK.lock().await;
+        let cfg = scratch_dir("cfg");
+        let downloads = scratch_dir("descargas");
+        std::fs::write(
+            cfg.join("user-dirs.dirs"),
+            format!("XDG_DOWNLOAD_DIR=\"{}\"\n", downloads.display()),
+        )
+        .unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &cfg);
+        assert_eq!(
+            dirs::download_dir().as_deref(),
+            Some(downloads.as_path()),
+            "la redirección de la carpeta de descargas debe funcionar"
+        );
+
+        let client = real_identity();
+        let (mut s, _rx) = session(true, 1);
+        s.fingerprint = String::new();
+        let mut rt = runtime(vec![("par", s)]);
+        rt.identity = Arc::new(client);
+        let state = Arc::new(Mutex::new(State {
+            devices: HashMap::new(),
+            apps: HashMap::new(),
+            cameras: HashMap::new(),
+            windows: Default::default(),
+            webcam: Default::default(),
+            registry: Default::default(),
+            channel: Some(rt),
+        }));
+        let loopback: IpAddr = std::net::Ipv4Addr::LOCALHOST.into();
+
+        // Atacante: otro certificado que el fijado para el par.
+        let pinned = real_identity();
+        let impostor = real_identity();
+        let port = spawn_payload_server(impostor, b"hola".to_vec()).await;
+        let res = download_file(
+            &offer(port, 4),
+            "foto.jpg",
+            loopback,
+            &pinned.fingerprint,
+            &state,
+        )
+        .await;
+        assert!(res.is_err(), "otra huella debe cortar la descarga: {res:?}");
+        assert!(
+            only_files(&downloads).is_empty(),
+            "no debe quedar ningún archivo: {:?}",
+            only_files(&downloads)
+        );
+
+        // Control: con la huella correcta el mismo montaje sí escribe (si no, la
+        // prueba de arriba sería vacía).
+        let port = spawn_payload_server(pinned_clone(&pinned), b"hola".to_vec()).await;
+        let path = download_file(
+            &offer(port, 4),
+            "foto.jpg",
+            loopback,
+            &pinned.fingerprint,
+            &state,
+        )
+        .await
+        .expect("con la huella fijada debe recibir");
+        assert_eq!(std::fs::read(path).unwrap(), b"hola");
+
+        let _ = std::fs::remove_dir_all(&cfg);
+        let _ = std::fs::remove_dir_all(&downloads);
+    }
+
+    fn pinned_clone(i: &Identity) -> Identity {
+        Identity {
+            cert_der: i.cert_der.clone(),
+            key_der: i.key_der.clone_key(),
+            fingerprint: i.fingerprint.clone(),
+            device_id: i.device_id.clone(),
+        }
+    }
+
+    #[tokio::test]
+    async fn el_temporal_no_sigue_un_symlink_plantado() {
+        let dir = scratch_dir("symlink");
+        let victim = dir.join("victima.txt");
+        std::fs::write(&victim, b"intacto").unwrap();
+        let tmp = dir.join(".vsk-connect-0.part");
+        std::os::unix::fs::symlink(&victim, &tmp).unwrap();
+
+        let mut body: &[u8] = b"hola";
+        let res = stream_payload_to_file(&mut body, 4, &tmp).await;
+
+        assert!(res.is_err(), "O_EXCL debe fallar ante un symlink: {res:?}");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"intacto");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Serializa las pruebas que redirigen `XDG_CONFIG_HOME` (global del proceso).
+    static ENV_LOCK: Mutex<()> = Mutex::const_new(());
+
+    /// Redirige `dirs::download_dir()` a una carpeta nueva; devuelve (config, descargas).
+    fn redirect_downloads() -> (std::path::PathBuf, std::path::PathBuf) {
+        let cfg = scratch_dir("cfg");
+        let downloads = scratch_dir("descargas");
+        std::fs::write(
+            cfg.join("user-dirs.dirs"),
+            format!("XDG_DOWNLOAD_DIR=\"{}\"\n", downloads.display()),
+        )
+        .unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &cfg);
+        assert_eq!(dirs::download_dir().as_deref(), Some(downloads.as_path()));
+        (cfg, downloads)
+    }
+
+    fn state_with_identity(identity: Identity) -> Arc<Mutex<State>> {
+        let mut rt = runtime(vec![]);
+        rt.identity = Arc::new(identity);
+        Arc::new(Mutex::new(State {
+            devices: HashMap::new(),
+            apps: HashMap::new(),
+            cameras: HashMap::new(),
+            windows: Default::default(),
+            webcam: Default::default(),
+            registry: Default::default(),
+            channel: Some(rt),
+        }))
+    }
+
+    #[tokio::test]
+    async fn el_quinto_permiso_de_transferencia_se_niega_hasta_que_se_suelta_uno() {
+        let state = state_with_identity(real_identity());
+        let mut held = Vec::new();
+        for _ in 0..MAX_CONCURRENT_FILE_TRANSFERS {
+            held.push(
+                file_transfer_permit(&state)
+                    .await
+                    .expect("hasta el tope se concede"),
+            );
+        }
+        assert!(
+            file_transfer_permit(&state).await.is_none(),
+            "pasado el tope no se concede ni se encola"
+        );
+        held.pop();
+        assert!(
+            file_transfer_permit(&state).await.is_some(),
+            "al soltar uno vuelve a haber lugar"
+        );
+    }
+
+    #[tokio::test]
+    async fn sin_canal_no_hay_permiso_de_transferencia() {
+        let state = state_with_identity(real_identity());
+        state.lock().await.channel = None;
+        assert!(file_transfer_permit(&state).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn dos_recepciones_del_mismo_nombre_no_se_pisan_ni_siguen_un_symlink() {
+        let _env = ENV_LOCK.lock().await;
+        let (cfg, downloads) = redirect_downloads();
+        let pinned = real_identity();
+        let state = state_with_identity(real_identity());
+        let loopback: IpAddr = std::net::Ipv4Addr::LOCALHOST.into();
+        let fp = pinned.fingerprint.clone();
+
+        // Un symlink plantado en el destino final: no se sigue ni se pisa.
+        let victim = downloads.join("victima.txt");
+        std::fs::write(&victim, b"intacto").unwrap();
+        std::os::unix::fs::symlink(&victim, downloads.join("foto.jpg")).unwrap();
+
+        let port = spawn_payload_server(pinned_clone(&pinned), b"uno".to_vec()).await;
+        let first = download_file(&offer(port, 3), "foto.jpg", loopback, &fp, &state)
+            .await
+            .expect("primera recepción");
+        let port = spawn_payload_server(pinned_clone(&pinned), b"dos".to_vec()).await;
+        let second = download_file(&offer(port, 3), "foto.jpg", loopback, &fp, &state)
+            .await
+            .expect("segunda recepción");
+
+        // El nombre final (el que lleva la señal `file_received`) sale de la ruta.
+        assert_eq!(first.file_name().unwrap(), "foto (1).jpg");
+        assert_eq!(second.file_name().unwrap(), "foto (2).jpg");
+        assert_eq!(std::fs::read(&first).unwrap(), b"uno");
+        assert_eq!(std::fs::read(&second).unwrap(), b"dos");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"intacto");
+        assert!(
+            std::fs::symlink_metadata(downloads.join("foto.jpg"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "el symlink del destino sigue siendo el que era"
+        );
+        assert!(
+            !only_files(&downloads).iter().any(|f| f.ends_with(".part")),
+            "no queda ningún temporal: {:?}",
+            only_files(&downloads)
+        );
+
+        let _ = std::fs::remove_dir_all(&cfg);
+        let _ = std::fs::remove_dir_all(&downloads);
+    }
+
+    #[tokio::test]
+    async fn la_oferta_de_una_sesion_reemplazada_no_resuelve_el_endpoint() {
+        let state = state_with_identity(real_identity());
+        let (mut s, _rx) = session(true, 7);
+        s.fingerprint = "aa:bb".into();
+        state
+            .lock()
+            .await
+            .channel
+            .as_mut()
+            .unwrap()
+            .sessions
+            .insert("par".into(), s);
+
+        let got = session_peer_endpoint(&state, "par", 7).await;
+        assert_eq!(
+            got,
+            Some((std::net::Ipv4Addr::LOCALHOST.into(), "aa:bb".to_string()))
+        );
+        assert_eq!(
+            session_peer_endpoint(&state, "par", 6).await,
+            None,
+            "otra sesión con el mismo device_id no hereda el endpoint"
+        );
+        assert_eq!(session_peer_endpoint(&state, "otro", 7).await, None);
     }
 }

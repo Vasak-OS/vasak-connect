@@ -770,6 +770,127 @@ pub fn accept_incoming_clipboard(paired: bool, text: String) -> Option<String> {
     Some(text)
 }
 
+// ── Recepción de archivos ────────────────────────────────────────────────────
+
+/// Tope de un archivo entrante, en bytes. Un `FileOffer` que lo pase se rechaza
+/// antes de abrir la conexión de carga: así un par no puede anunciar un tamaño
+/// enorme y hacernos llenar el disco de descargas.
+///
+/// shortcut: 2 GiB fijo y generoso para fotos y videos del teléfono; si hiciera
+/// falta un límite por espacio libre real o configurable, lo ajusta security.
+pub const MAX_FILE_SIZE: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Largo máximo de un componente de nombre de archivo, en bytes. Es el límite
+/// típico (255) de la mayoría de los sistemas de archivos; un nombre más largo
+/// haría fallar la apertura o el enlace.
+const MAX_FILENAME_BYTES: usize = 255;
+
+/// Qué hacer con un `FileOffer` entrante, decidido sin tocar la red ni el disco.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileOfferDecision {
+    /// El par no está pareado: se ignora en silencio, **sin** contestarle nada.
+    /// No se le confirma ni se le niega un archivo a un aparato sin parear, igual
+    /// que con la batería y el portapapeles.
+    Ignore,
+    /// Par pareado pero el ofrecimiento no pasa —nombre inseguro o tamaño sobre el
+    /// tope—: se rechaza con `FileResult { ok: false }`, sin abrir nada.
+    Reject,
+    /// Par pareado y ofrecimiento válido: se recibe en este nombre ya saneado.
+    Accept { filename: String },
+}
+
+/// Sanea el nombre propuesto por el par antes de unirlo a una ruta.
+///
+/// El contrato ([`wire::FileOffer::name`]) avisa que el emisor no garantiza nada:
+/// el nombre puede traer barras, `..`, un NUL, ser vacío o absoluto. Acá se
+/// devuelve sólo un nombre de archivo simple —sin separadores de ruta, sin `..`,
+/// sin caracteres de control, no vacío y de largo acotado— o `None` para
+/// rechazarlo. El destino final es siempre `download_dir().join(este nombre)`;
+/// como no quedan separadores, ese `join` no puede escapar de la carpeta.
+pub fn sanitize_incoming_filename(name: &str) -> Option<String> {
+    if name.is_empty() {
+        return None;
+    }
+    // Un nombre más largo que el límite del FS ([`MAX_FILENAME_BYTES`]) sólo haría
+    // fallar el `create`, así que se rechaza acá, donde se puede probar.
+    if name.len() > MAX_FILENAME_BYTES {
+        return None;
+    }
+    // Separadores de ruta (incluido `\` por defensa en profundidad) y caracteres
+    // de control (el NUL entre ellos) no van en un nombre de archivo.
+    if name.contains('/') || name.contains('\\') || name.chars().any(char::is_control) {
+        return None;
+    }
+    // `.` y `..` no son nombres de archivo utilizables y `..` es el caso de
+    // escape clásico.
+    if name == "." || name == ".." {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+/// La decisión sobre un `FileOffer` entrante: la puerta de confianza (pareado), el
+/// tope de tamaño y el saneo del nombre, todo sin red ni disco.
+pub fn decide_incoming_file(paired: bool, name: &str, size: u64) -> FileOfferDecision {
+    if !paired {
+        return FileOfferDecision::Ignore;
+    }
+    if size > MAX_FILE_SIZE {
+        return FileOfferDecision::Reject;
+    }
+    match sanitize_incoming_filename(name) {
+        Some(filename) => FileOfferDecision::Accept { filename },
+        None => FileOfferDecision::Reject,
+    }
+}
+
+/// El nombre a usar en el intento número `n` para no pisar un archivo que ya
+/// existe: el nombre tal cual en `n == 0`, y con un sufijo ` (n)` antes de la
+/// extensión en los siguientes. Pura para poder probar la desambiguación sin
+/// tocar el disco; el bucle que mira si existe cada candidato vive en el código
+/// async.
+///
+/// El resultado nunca pasa [`MAX_FILENAME_BYTES`]: si el sufijo lo haría pasar, se
+/// acorta la base (nunca el sufijo ni la extensión) en un borde de carácter UTF-8,
+/// porque un nombre de 255 bytes más ` (1)` daría 259 y la apertura o el enlace
+/// fallarían.
+pub fn numbered_filename(name: &str, n: u32) -> String {
+    if n == 0 {
+        return name.to_string();
+    }
+    let suffix = format!(" ({n})");
+    let (base, tail) = match name.rsplit_once('.') {
+        // Sólo se trata el punto como separador de extensión si hay algo antes
+        // (un oculto como `.bashrc` lleva el sufijo al final, no en medio).
+        Some((stem, ext)) if !stem.is_empty() => (stem, format!(".{ext}")),
+        _ => (name, String::new()),
+    };
+    // Con una extensión larguísima, el sufijo y la extensión por sí solos ya
+    // pasarían el límite: no se puede conservar la extensión sin excederse, así que
+    // se trata todo el nombre como base y se trunca el conjunto. El resultado queda
+    // siempre ≤ el límite. Con una extensión corta —el caso normal— no cambia nada.
+    let (base, tail) = if suffix.len() + tail.len() > MAX_FILENAME_BYTES {
+        (name, String::new())
+    } else {
+        (base, tail)
+    };
+    let budget = MAX_FILENAME_BYTES.saturating_sub(suffix.len() + tail.len());
+    format!("{}{suffix}{tail}", truncate_to_bytes(base, budget))
+}
+
+/// El prefijo más largo de `s` que entra en `max` bytes sin partir un carácter
+/// multibyte.
+fn truncate_to_bytes(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1400,5 +1521,179 @@ mod tests {
     #[test]
     fn el_portapapeles_vacio_de_un_par_pareado_se_ignora() {
         assert_eq!(accept_incoming_clipboard(true, String::new()), None);
+    }
+
+    #[test]
+    fn un_nombre_simple_de_archivo_se_acepta_tal_cual() {
+        assert_eq!(
+            sanitize_incoming_filename("foto.jpg"),
+            Some("foto.jpg".to_string())
+        );
+        assert_eq!(
+            sanitize_incoming_filename(".bashrc"),
+            Some(".bashrc".to_string())
+        );
+    }
+
+    #[test]
+    fn un_nombre_con_recorrido_de_ruta_se_rechaza() {
+        for malo in ["..", ".", "../x", "a/b", "a\\b", "/etc/passwd", "C:\\x\\y"] {
+            assert_eq!(sanitize_incoming_filename(malo), None, "{malo:?}");
+        }
+    }
+
+    #[test]
+    fn un_nombre_con_nul_o_caracteres_de_control_se_rechaza() {
+        for malo in ["a\0b", "a\nb", "a\tb", "\u{7f}x"] {
+            assert_eq!(sanitize_incoming_filename(malo), None, "{malo:?}");
+        }
+    }
+
+    #[test]
+    fn un_nombre_vacio_se_rechaza() {
+        assert_eq!(sanitize_incoming_filename(""), None);
+    }
+
+    #[test]
+    fn el_nombre_de_255_bytes_pasa_y_el_de_256_no() {
+        assert!(sanitize_incoming_filename(&"a".repeat(255)).is_some());
+        assert_eq!(sanitize_incoming_filename(&"a".repeat(256)), None);
+        // El límite es en bytes, no en caracteres: 128 'ñ' son 256 bytes.
+        assert_eq!(sanitize_incoming_filename(&"ñ".repeat(128)), None);
+    }
+
+    #[test]
+    fn una_oferta_de_un_par_sin_parear_se_ignora_aunque_sea_valida() {
+        assert_eq!(
+            decide_incoming_file(false, "foto.jpg", 10),
+            FileOfferDecision::Ignore
+        );
+        // Ni siquiera un nombre malo o un tamaño excesivo se contesta.
+        assert_eq!(
+            decide_incoming_file(false, "../x", u64::MAX),
+            FileOfferDecision::Ignore
+        );
+    }
+
+    #[test]
+    fn una_oferta_pareada_valida_se_acepta_con_el_nombre_saneado() {
+        assert_eq!(
+            decide_incoming_file(true, "foto.jpg", 10),
+            FileOfferDecision::Accept {
+                filename: "foto.jpg".into()
+            }
+        );
+        assert_eq!(
+            decide_incoming_file(true, "vacio", 0),
+            FileOfferDecision::Accept {
+                filename: "vacio".into()
+            }
+        );
+    }
+
+    #[test]
+    fn una_oferta_pareada_con_nombre_inseguro_se_rechaza() {
+        assert_eq!(
+            decide_incoming_file(true, "../x", 10),
+            FileOfferDecision::Reject
+        );
+    }
+
+    #[test]
+    fn una_oferta_pareada_sobre_el_tope_se_rechaza_y_en_el_tope_se_acepta() {
+        assert_eq!(
+            decide_incoming_file(true, "a", MAX_FILE_SIZE),
+            FileOfferDecision::Accept {
+                filename: "a".into()
+            }
+        );
+        assert_eq!(
+            decide_incoming_file(true, "a", MAX_FILE_SIZE + 1),
+            FileOfferDecision::Reject
+        );
+        assert_eq!(MAX_FILE_SIZE, 2 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn el_intento_cero_conserva_el_nombre() {
+        assert_eq!(numbered_filename("foto.jpg", 0), "foto.jpg");
+        assert_eq!(numbered_filename("README", 0), "README");
+    }
+
+    #[test]
+    fn el_sufijo_numerado_va_antes_de_la_extension() {
+        assert_eq!(numbered_filename("foto.jpg", 1), "foto (1).jpg");
+        assert_eq!(numbered_filename("foto.jpg", 12), "foto (12).jpg");
+    }
+
+    #[test]
+    fn un_nombre_sin_extension_lleva_el_sufijo_al_final() {
+        assert_eq!(numbered_filename("README", 2), "README (2)");
+    }
+
+    #[test]
+    fn con_varios_puntos_la_extension_es_la_ultima() {
+        assert_eq!(numbered_filename("a.tar.gz", 1), "a.tar (1).gz");
+    }
+
+    #[test]
+    fn un_oculto_sin_extension_lleva_el_sufijo_al_final() {
+        assert_eq!(numbered_filename(".bashrc", 1), ".bashrc (1)");
+    }
+
+    #[test]
+    fn el_numerado_de_un_nombre_de_255_bytes_no_pasa_de_255() {
+        let name = format!("{}.jpg", "a".repeat(251));
+        assert_eq!(name.len(), 255);
+        let out = numbered_filename(&name, 1);
+        assert!(out.len() <= 255, "{} bytes", out.len());
+        assert!(out.ends_with(" (1).jpg"), "{out}");
+        // Sin extensión también.
+        let out = numbered_filename(&"a".repeat(255), 12);
+        assert_eq!(out.len(), 255);
+        assert!(out.ends_with(" (12)"));
+    }
+
+    #[test]
+    fn el_numerado_recorta_en_borde_de_caracter_multibyte() {
+        // 126 'ñ' (252 bytes) + ".md": 255 bytes. Con " (1)" hay que quitar
+        // bytes de la base, y 'ñ' ocupa 2: no se puede cortar en el medio.
+        let name = format!("{}.md", "ñ".repeat(126));
+        assert_eq!(name.len(), 255);
+        let out = numbered_filename(&name, 1);
+        assert!(out.len() <= 255, "{} bytes", out.len());
+        assert!(out.ends_with(" (1).md"), "{out}");
+        assert!(out.starts_with('ñ'));
+        // Emoji de 4 bytes: lo mismo.
+        let name = format!("{}.md", "😀".repeat(63));
+        assert_eq!(name.len(), 255);
+        let out = numbered_filename(&name, 1);
+        assert!(out.len() <= 255, "{} bytes", out.len());
+        assert!(out.ends_with(" (1).md"), "{out}");
+        assert!(out.trim_end_matches(" (1).md").chars().all(|c| c == '😀'));
+    }
+
+    #[test]
+    fn el_numerado_con_extension_larga_no_pasa_de_255_bytes() {
+        // La extensión sola casi llena el límite: el sufijo no cabe.
+        let name = format!("a.{}", "x".repeat(253));
+        assert_eq!(name.len(), 255);
+        let out = numbered_filename(&name, 1);
+        assert!(out.len() <= 255, "{} bytes", out.len());
+        assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn el_numerado_con_extension_larga_corta_en_borde_multibyte() {
+        // 'ñ' (2 bytes) en la extensión: el corte final cae en medio de una.
+        let name = format!("a.{}", "ñ".repeat(126));
+        assert_eq!(name.len(), 254);
+        for n in [1u32, 2, 10] {
+            let out = numbered_filename(&name, n);
+            assert!(out.len() <= 255, "n={n}: {} bytes", out.len());
+        }
+        let name = format!("a.{}", "😀".repeat(63));
+        let out = numbered_filename(&name, 1);
+        assert!(out.len() <= 255, "{} bytes", out.len());
     }
 }
